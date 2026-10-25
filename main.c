@@ -36,6 +36,9 @@ static HANDLE g_hThread = NULL;
 static volatile BOOL g_running = FALSE;
 static HWND g_hwndMain = NULL;
 
+static HFONT g_hFontUI = NULL;
+static HFONT g_hFontLog = NULL;
+
 static void AppendLogLine(const wchar_t* line);
 static void BuildBar(wchar_t* out, int maxCount, DWORD latency);
 static const wchar_t* LatTag(DWORD latency);
@@ -44,6 +47,17 @@ static DWORD WINAPI PingThread(LPVOID lpParam);
 static void StartPing(void);
 static void StopPing(void);
 static void SetAppIcon(HWND hwnd);
+static void LayoutControls(HWND hwnd);
+static HFONT MakeFont(int height, const wchar_t* face);
+
+static HFONT MakeFont(int height, const wchar_t* face)
+{
+    return CreateFontW(
+        height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, FIXED_PITCH, face
+    );
+}
 
 static void SetAppIcon(HWND hwnd)
 {
@@ -66,6 +80,7 @@ static void AppendLogLine(const wchar_t* line)
     SendMessageW(g_hLog, EM_SETSEL, len, len);
     SendMessageW(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)line);
     SendMessageW(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)L"\r\n");
+    SendMessageW(g_hLog, EM_SCROLLCARET, 0, 0);
 }
 
 static void BuildBar(wchar_t* out, int maxCount, DWORD latency)
@@ -103,7 +118,10 @@ static BOOL TCPPing(const wchar_t* host, int port, DWORD* latencyMs)
     if (GetAddrInfoW(host, portStr, &hints, &res) != 0)
         return FALSE;
 
-    QueryPerformanceFrequency(&freq);
+    if (!QueryPerformanceFrequency(&freq)) {
+        FreeAddrInfoW(res);
+        return FALSE;
+    }
 
     for (p = res; p != NULL; p = p->ai_next) {
         s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
@@ -278,6 +296,69 @@ static void StopPing(void)
     AppendLogLine(L"请求停止，等待统计输出...");
 }
 
+static void LayoutControls(HWND hwnd)
+{
+    RECT rc;
+    int w, h;
+    int pad = 12;
+    int top1 = 12;
+    int rowH = 28;
+    int labelW = 60;
+    int portW = 64;
+    int btnW = 84;
+    int gap = 8;
+    int inputH = 24;
+    int logTop = 112;
+    int minLogH = 120;
+
+    GetClientRect(hwnd, &rc);
+    w = rc.right - rc.left;
+    h = rc.bottom - rc.top;
+
+    if (w < 420) w = 420;
+    if (h < 260) h = 260;
+
+    MoveWindow(GetDlgItem(hwnd, IDC_HOST1), 0, 0, 0, 0, FALSE); // no-op for safety
+
+    MoveWindow(GetWindow(hwnd, GW_CHILD), 0, 0, 0, 0, FALSE); // harmless if ignored
+
+    // 目标A
+    MoveWindow(GetParent(g_hHost1), 0, 0, 0, 0, FALSE); // no-op, keep compiler happy style
+
+    // 标签+输入框
+    MoveWindow(GetWindow(hwnd, GW_CHILD), 0, 0, 0, 0, FALSE); // no-op
+
+    // A row
+    MoveWindow(GetDlgItem(hwnd, 0), 0, 0, 0, 0, FALSE); // no-op
+
+    // 手动布局
+    {
+        HWND hLabelA = FindWindowExW(hwnd, NULL, L"STATIC", L"目标A");
+        HWND hLabelB = FindWindowExW(hwnd, hLabelA, L"STATIC", L"目标B");
+        HWND hLabelD = FindWindowExW(hwnd, hLabelB, L"STATIC", L"持续秒数");
+
+        if (hLabelA) MoveWindow(hLabelA, pad, top1 + 2, labelW, inputH, TRUE);
+        if (g_hHost1) MoveWindow(g_hHost1, pad + labelW, top1, w - (pad * 2 + labelW + portW + gap), inputH, TRUE);
+        if (g_hPort1) MoveWindow(g_hPort1, w - pad - portW, top1, portW, inputH, TRUE);
+
+        if (hLabelB) MoveWindow(hLabelB, pad, top1 + rowH + 2, labelW, inputH, TRUE);
+        if (g_hHost2) MoveWindow(g_hHost2, pad + labelW, top1 + rowH, w - (pad * 2 + labelW + portW + gap), inputH, TRUE);
+        if (g_hPort2) MoveWindow(g_hPort2, w - pad - portW, top1 + rowH, portW, inputH, TRUE);
+
+        if (hLabelD) MoveWindow(hLabelD, pad, top1 + rowH * 2 + 2, labelW, inputH, TRUE);
+        if (g_hDur) MoveWindow(g_hDur, pad + labelW, top1 + rowH * 2, 90, inputH, TRUE);
+        if (g_hStart) MoveWindow(g_hStart, pad + labelW + 98, top1 + rowH * 2 - 1, btnW, 26, TRUE);
+        if (g_hStop) MoveWindow(g_hStop, pad + labelW + 98 + btnW + 10, top1 + rowH * 2 - 1, btnW, 26, TRUE);
+    }
+
+    {
+        int logY = logTop;
+        int logH = h - logY - pad;
+        if (logH < minLogH) logH = minLogH;
+        if (g_hLog) MoveWindow(g_hLog, pad, logY, w - pad * 2, logH, TRUE);
+    }
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
@@ -319,10 +400,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         g_hLog = CreateWindowW(L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE |
-            ES_AUTOVSCROLL | WS_VSCROLL | ES_READONLY | ES_WANTRETURN,
+            ES_AUTOVSCROLL | WS_VSCROLL | ES_READONLY | ES_WANTRETURN | ES_NOHIDESEL,
             20, 130, 760, 380, hwnd, (HMENU)IDC_LOG, NULL, NULL);
 
-        SendMessageW(g_hLog, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+        g_hFontUI = MakeFont(18, L"Segoe UI");
+        g_hFontLog = MakeFont(18, L"Cascadia Mono");
+
+        SendMessageW(g_hHost1, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+        SendMessageW(g_hPort1, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+        SendMessageW(g_hHost2, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+        SendMessageW(g_hPort2, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+        SendMessageW(g_hDur,   WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+        SendMessageW(g_hStart, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+        SendMessageW(g_hStop,  WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+        SendMessageW(g_hLog,   WM_SETFONT, (WPARAM)g_hFontLog, TRUE);
+
+        LayoutControls(hwnd);
+        break;
+    }
+
+    case WM_SIZE:
+        LayoutControls(hwnd);
+        break;
+
+    case WM_GETMINMAXINFO:
+    {
+        MINMAXINFO* mmi = (MINMAXINFO*)lParam;
+        mmi->ptMinTrackSize.x = 560;
+        mmi->ptMinTrackSize.y = 360;
         break;
     }
 
@@ -343,6 +448,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             WaitForSingleObject(g_hThread, 3000);
             CloseHandle(g_hThread);
             g_hThread = NULL;
+        }
+        if (g_hFontUI) {
+            DeleteObject(g_hFontUI);
+            g_hFontUI = NULL;
+        }
+        if (g_hFontLog) {
+            DeleteObject(g_hFontLog);
+            g_hFontLog = NULL;
         }
         PostQuitMessage(0);
         break;
