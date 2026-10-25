@@ -6,20 +6,23 @@
 
 #pragma comment(lib, "comctl32.lib")
 
-#define ID_EDIT_A   1001
-#define ID_EDIT_B   1002
-#define ID_EDIT_T   1003
-#define ID_BTN_OK   1004
-#define ID_BTN_STOP 1005
-#define ID_LIST     1006
-#define ID_LOG      1007
-#define ID_LABEL_A  1101
-#define ID_LABEL_B  1102
-#define ID_LABEL_T  1103
+#define ID_EDIT_A     1001
+#define ID_EDIT_APORT 1002
+#define ID_EDIT_B     1003
+#define ID_EDIT_BPORT 1004
+#define ID_EDIT_T     1005
+#define ID_BTN_OK     1006
+#define ID_BTN_STOP   1007
+#define ID_LIST       1008
+#define ID_LOG        1009
+#define ID_LABEL_A    1101
+#define ID_LABEL_AP   1102
+#define ID_LABEL_B    1103
+#define ID_LABEL_BP   1104
+#define ID_LABEL_T    1105
 
-static HWND g_hwndA, g_hwndB, g_hwndT;
-static HWND g_hBtnOK, g_hBtnStop;
-static HWND g_hList, g_hLog;
+static HWND g_hA, g_hAP, g_hB, g_hBP, g_hT;
+static HWND g_hBtnOK, g_hBtnStop, g_hList, g_hLog;
 static HFONT g_hFont = NULL;
 static HFONT g_hFontMono = NULL;
 
@@ -34,13 +37,10 @@ static HFONT MakeFont(int h, const wchar_t* face)
 
 static void ApplyFonts(void)
 {
-    SendMessageW(g_hwndA, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-    SendMessageW(g_hwndB, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-    SendMessageW(g_hwndT, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-    SendMessageW(g_hBtnOK, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-    SendMessageW(g_hBtnStop, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-    SendMessageW(g_hList, WM_SETFONT, (WPARAM)g_hFontMono, TRUE);
-    SendMessageW(g_hLog, WM_SETFONT, (WPARAM)g_hFontMono, TRUE);
+    HWND ctrls[] = { g_hA, g_hAP, g_hB, g_hBP, g_hT, g_hBtnOK, g_hBtnStop, g_hList, g_hLog };
+    for (int i = 0; i < 9; i++) {
+        SendMessageW(ctrls[i], WM_SETFONT, (WPARAM)(i >= 7 ? g_hFontMono : g_hFont), TRUE);
+    }
 }
 
 static void InitList(HWND hList)
@@ -49,14 +49,11 @@ static void InitList(HWND hList)
     col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
 
     col.pszText = L"时间"; col.cx = 110; ListView_InsertColumn(hList, 0, &col);
-    col.pszText = L"A";    col.cx = 180; ListView_InsertColumn(hList, 1, &col);
-    col.pszText = L"B";    col.cx = 180; ListView_InsertColumn(hList, 2, &col);
+    col.pszText = L"A";    col.cx = 160; ListView_InsertColumn(hList, 1, &col);
+    col.pszText = L"B";    col.cx = 160; ListView_InsertColumn(hList, 2, &col);
     col.pszText = L"备注";  col.cx = 120; ListView_InsertColumn(hList, 3, &col);
 
-    ListView_SetExtendedListViewStyle(
-        hList,
-        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER
-    );
+    ListView_SetExtendedListViewStyle(hList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
 }
 
 static void Layout(HWND hwnd)
@@ -64,47 +61,49 @@ static void Layout(HWND hwnd)
     RECT rc;
     GetClientRect(hwnd, &rc);
 
-    const int m = 14;
-    const int labelW = 64;
-    const int editH = 26;
+    const int m = 16;
+    const int labelW = 72;
+    const int editH = 28;
     const int rowH = 34;
     const int gap = 8;
-    const int btnW = 84;
-    const int btnH = 28;
+    const int btnW = 90;
+    const int btnH = 30;
 
-    int x1 = m + labelW;
-    int x2 = x1 + 220 + 10;
-    int xBtn = x2;
-    int wEdit = 220;
+    int xLabel = m;
+    int xEdit = m + labelW;
+    int xPort = xEdit + 240 + 10;
+    int xBtn = xPort + 90 + 16;
 
     int y1 = m;
     int y2 = y1 + rowH;
     int y3 = y2 + rowH;
 
-    MoveWindow(GetDlgItem(hwnd, ID_LABEL_A), m, y1 + 4, labelW, 20, TRUE);
-    MoveWindow(g_hwndA, x1, y1, wEdit, editH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_LABEL_A), xLabel, y1 + 4, labelW, 20, TRUE);
+    MoveWindow(g_hA, xEdit, y1, 240, editH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_LABEL_AP), xPort - 2, y1 + 4, 42, 20, TRUE);
+    MoveWindow(g_hAP, xPort + 38, y1, 80, editH, TRUE);
 
-    MoveWindow(GetDlgItem(hwnd, ID_LABEL_B), m, y2 + 4, labelW, 20, TRUE);
-    MoveWindow(g_hwndB, x1, y2, wEdit, editH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_LABEL_B), xLabel, y2 + 4, labelW, 20, TRUE);
+    MoveWindow(g_hB, xEdit, y2, 240, editH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_LABEL_BP), xPort - 2, y2 + 4, 42, 20, TRUE);
+    MoveWindow(g_hBP, xPort + 38, y2, 80, editH, TRUE);
 
-    MoveWindow(GetDlgItem(hwnd, ID_LABEL_T), m, y3 + 4, labelW, 20, TRUE);
-    MoveWindow(g_hwndT, x1, y3, 90, editH, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_LABEL_T), xLabel, y3 + 4, labelW, 20, TRUE);
+    MoveWindow(g_hT, xEdit, y3, 100, editH, TRUE);
 
-    MoveWindow(g_hBtnOK,  xBtn,     y3 - 1, btnW, btnH, TRUE);
-    MoveWindow(g_hBtnStop, xBtn+92,  y3 - 1, btnW, btnH, TRUE);
+    MoveWindow(g_hBtnOK, xBtn, y3 - 1, btnW, btnH, TRUE);
+    MoveWindow(g_hBtnStop, xBtn + 100, y3 - 1, btnW, btnH, TRUE);
 
-    int listTop = y3 + rowH + 6;
+    int listTop = y3 + rowH + 8;
     int listH = (rc.bottom - listTop - m) * 2 / 3;
     int logTop = listTop + listH + gap;
     int logH = rc.bottom - logTop - m;
 
     if (listH < 120) listH = 120;
-    if (logH < 70) logH = 70;
+    if (logH < 80) logH = 80;
 
     MoveWindow(g_hList, m, listTop, rc.right - m * 2, listH, TRUE);
-    MoveWindow(g_hLog,  m, logTop,  rc.right - m * 2, logH, TRUE);
-
-    ListView_SetColumnWidth(g_hList, 0, LVSCW_AUTOSIZE_USEHEADER);
+    MoveWindow(g_hLog, m, logTop, rc.right - m * 2, logH, TRUE);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -112,34 +111,39 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg) {
     case WM_CREATE:
     {
-        CreateWindowW(L"STATIC", L"目标A",
-            WS_CHILD | WS_VISIBLE,
+        CreateWindowW(L"STATIC", L"目标A", WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, hwnd, (HMENU)ID_LABEL_A, NULL, NULL);
-
-        g_hwndA = CreateWindowW(L"EDIT", L"192.168.1.1",
+        g_hA = CreateWindowW(L"EDIT", L"192.168.1.1",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
             0, 0, 0, 0, hwnd, (HMENU)ID_EDIT_A, NULL, NULL);
 
-        CreateWindowW(L"STATIC", L"目标B",
-            WS_CHILD | WS_VISIBLE,
-            0, 0, 0, 0, hwnd, (HMENU)ID_LABEL_B, NULL, NULL);
+        CreateWindowW(L"STATIC", L"端口", WS_CHILD | WS_VISIBLE,
+            0, 0, 0, 0, hwnd, (HMENU)ID_LABEL_AP, NULL, NULL);
+        g_hAP = CreateWindowW(L"EDIT", L"80",
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            0, 0, 0, 0, hwnd, (HMENU)ID_EDIT_APORT, NULL, NULL);
 
-        g_hwndB = CreateWindowW(L"EDIT", L"z.cn",
+        CreateWindowW(L"STATIC", L"目标B", WS_CHILD | WS_VISIBLE,
+            0, 0, 0, 0, hwnd, (HMENU)ID_LABEL_B, NULL, NULL);
+        g_hB = CreateWindowW(L"EDIT", L"z.cn",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
             0, 0, 0, 0, hwnd, (HMENU)ID_EDIT_B, NULL, NULL);
 
-        CreateWindowW(L"STATIC", L"持续秒",
-            WS_CHILD | WS_VISIBLE,
-            0, 0, 0, 0, hwnd, (HMENU)ID_LABEL_T, NULL, NULL);
+        CreateWindowW(L"STATIC", L"端口", WS_CHILD | WS_VISIBLE,
+            0, 0, 0, 0, hwnd, (HMENU)ID_LABEL_BP, NULL, NULL);
+        g_hBP = CreateWindowW(L"EDIT", L"443",
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            0, 0, 0, 0, hwnd, (HMENU)ID_EDIT_BPORT, NULL, NULL);
 
-        g_hwndT = CreateWindowW(L"EDIT", L"51",
+        CreateWindowW(L"STATIC", L"持续秒", WS_CHILD | WS_VISIBLE,
+            0, 0, 0, 0, hwnd, (HMENU)ID_LABEL_T, NULL, NULL);
+        g_hT = CreateWindowW(L"EDIT", L"51",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
             0, 0, 0, 0, hwnd, (HMENU)ID_EDIT_T, NULL, NULL);
 
         g_hBtnOK = CreateWindowW(L"BUTTON", L"开始",
             WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, hwnd, (HMENU)ID_BTN_OK, NULL, NULL);
-
         g_hBtnStop = CreateWindowW(L"BUTTON", L"停止",
             WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, hwnd, (HMENU)ID_BTN_STOP, NULL, NULL);
@@ -147,14 +151,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_hList = CreateWindowW(WC_LISTVIEWW, L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL,
             0, 0, 0, 0, hwnd, (HMENU)ID_LIST, NULL, NULL);
-
         g_hLog = CreateWindowW(L"EDIT", L"准备就绪。\r\n",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE |
             ES_AUTOVSCROLL | WS_VSCROLL | ES_READONLY | ES_NOHIDESEL,
             0, 0, 0, 0, hwnd, (HMENU)ID_LOG, NULL, NULL);
 
-        g_hFont = MakeFont(20, L"Segoe UI");
-        g_hFontMono = MakeFont(18, L"Cascadia Mono");
+        g_hFont = MakeFont(24, L"Segoe UI");
+        g_hFontMono = MakeFont(20, L"Cascadia Mono");
+
         ApplyFonts();
         InitList(g_hList);
         Layout(hwnd);
@@ -168,13 +172,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_GETMINMAXINFO:
     {
         MINMAXINFO* mmi = (MINMAXINFO*)lParam;
-        mmi->ptMinTrackSize.x = 620;
-        mmi->ptMinTrackSize.y = 430;
+        mmi->ptMinTrackSize.x = 720;
+        mmi->ptMinTrackSize.y = 500;
         return 0;
     }
-
-    case WM_COMMAND:
-        return 0;
 
     case WM_DESTROY:
         if (g_hFont) DeleteObject(g_hFont);
@@ -194,9 +195,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, PWSTR lpCmdLine, int n
     WNDCLASSW wc = {0};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
-    wc.lpszClassName = L"LightGuiFrame";
+    wc.lpszClassName = L"LightGuiFrame2";
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    wc.hIconSm = LoadIconW(NULL, IDI_APPLICATION);
 
     if (!RegisterClassW(&wc))
         return 0;
@@ -205,7 +208,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, PWSTR lpCmdLine, int n
         wc.lpszClassName,
         L"TCPing 双目标对比",
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 860, 620,
+        CW_USEDEFAULT, CW_USEDEFAULT, 920, 680,
         NULL, NULL, hInstance, NULL
     );
 
