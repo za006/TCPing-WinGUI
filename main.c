@@ -1,6 +1,8 @@
 #include <windows.h>
 #include <commctrl.h>
 
+#define APP_ICON_ID   101
+
 #define ID_EDIT_A     1001
 #define ID_EDIT_APORT 1002
 #define ID_EDIT_B     1003
@@ -20,6 +22,7 @@ static HWND g_hA, g_hAP, g_hB, g_hBP, g_hT;
 static HWND g_hBtnOK, g_hBtnStop, g_hList, g_hLog;
 static HFONT g_hFont = NULL;
 static HFONT g_hFontMono = NULL;
+static HICON g_hIcon = NULL;
 
 static HFONT MakeFont(int h, const wchar_t* face)
 {
@@ -28,6 +31,24 @@ static HFONT MakeFont(int h, const wchar_t* face)
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face
     );
+}
+
+static void SetAppIcon(HWND hwnd, HINSTANCE hInst)
+{
+    g_hIcon = (HICON)LoadImageW(
+        hInst,
+        MAKEINTRESOURCEW(APP_ICON_ID),
+        IMAGE_ICON,
+        0, 0,
+        LR_DEFAULTSIZE
+    );
+
+    if (!g_hIcon) {
+        g_hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    }
+
+    SendMessageW(hwnd, WM_SETICON, ICON_BIG,   (LPARAM)g_hIcon);
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)g_hIcon);
 }
 
 static void ApplyFonts(void)
@@ -48,9 +69,9 @@ static void InitList(HWND hList)
     LVCOLUMNW col = {0};
     col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
 
-    col.pszText = L"时间"; col.cx = 110; ListView_InsertColumn(hList, 0, &col);
-    col.pszText = L"A";    col.cx = 160; ListView_InsertColumn(hList, 1, &col);
-    col.pszText = L"B";    col.cx = 160; ListView_InsertColumn(hList, 2, &col);
+    col.pszText = L"时间"; col.cx = 120; ListView_InsertColumn(hList, 0, &col);
+    col.pszText = L"A";    col.cx = 180; ListView_InsertColumn(hList, 1, &col);
+    col.pszText = L"B";    col.cx = 180; ListView_InsertColumn(hList, 2, &col);
     col.pszText = L"备注";  col.cx = 120; ListView_InsertColumn(hList, 3, &col);
 
     ListView_SetExtendedListViewStyle(
@@ -64,13 +85,13 @@ static void Layout(HWND hwnd)
     RECT rc;
     GetClientRect(hwnd, &rc);
 
-    const int m = 16;
+    const int m = 14;
     const int labelW = 72;
-    const int editH = 28;
-    const int rowH = 34;
+    const int editH = 30;
+    const int rowH = 38;
     const int gap = 8;
-    const int btnW = 90;
-    const int btnH = 30;
+    const int btnW = 92;
+    const int btnH = 32;
 
     int xLabel = m;
     int xEdit = m + labelW;
@@ -81,21 +102,21 @@ static void Layout(HWND hwnd)
     int y2 = y1 + rowH;
     int y3 = y2 + rowH;
 
-    MoveWindow(GetDlgItem(hwnd, ID_LABEL_A), xLabel, y1 + 4, labelW, 20, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_LABEL_A), xLabel, y1 + 6, labelW, 20, TRUE);
     MoveWindow(g_hA, xEdit, y1, 240, editH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, ID_LABEL_AP), xPort - 2, y1 + 4, 42, 20, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_LABEL_AP), xPort - 2, y1 + 6, 42, 20, TRUE);
     MoveWindow(g_hAP, xPort + 38, y1, 80, editH, TRUE);
 
-    MoveWindow(GetDlgItem(hwnd, ID_LABEL_B), xLabel, y2 + 4, labelW, 20, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_LABEL_B), xLabel, y2 + 6, labelW, 20, TRUE);
     MoveWindow(g_hB, xEdit, y2, 240, editH, TRUE);
-    MoveWindow(GetDlgItem(hwnd, ID_LABEL_BP), xPort - 2, y2 + 4, 42, 20, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_LABEL_BP), xPort - 2, y2 + 6, 42, 20, TRUE);
     MoveWindow(g_hBP, xPort + 38, y2, 80, editH, TRUE);
 
-    MoveWindow(GetDlgItem(hwnd, ID_LABEL_T), xLabel, y3 + 4, labelW, 20, TRUE);
+    MoveWindow(GetDlgItem(hwnd, ID_LABEL_T), xLabel, y3 + 6, labelW, 20, TRUE);
     MoveWindow(g_hT, xEdit, y3, 100, editH, TRUE);
 
     MoveWindow(g_hBtnOK, xBtn, y3 - 1, btnW, btnH, TRUE);
-    MoveWindow(g_hBtnStop, xBtn + 100, y3 - 1, btnW, btnH, TRUE);
+    MoveWindow(g_hBtnStop, xBtn + 102, y3 - 1, btnW, btnH, TRUE);
 
     int listTop = y3 + rowH + 8;
     int listH = (rc.bottom - listTop - m) * 2 / 3;
@@ -103,10 +124,15 @@ static void Layout(HWND hwnd)
     int logH = rc.bottom - logTop - m;
 
     if (listH < 120) listH = 120;
-    if (logH < 80) logH = 80;
+    if (logH < 90) logH = 90;
 
     MoveWindow(g_hList, m, listTop, rc.right - m * 2, listH, TRUE);
     MoveWindow(g_hLog, m, logTop, rc.right - m * 2, logH, TRUE);
+
+    ListView_SetColumnWidth(g_hList, 0, 120);
+    ListView_SetColumnWidth(g_hList, 1, 180);
+    ListView_SetColumnWidth(g_hList, 2, 180);
+    ListView_SetColumnWidth(g_hList, 3, 120);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -114,6 +140,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg) {
     case WM_CREATE:
     {
+        HINSTANCE hInst = ((LPCREATESTRUCTW)lParam)->hInstance;
+        SetAppIcon(hwnd, hInst);
+
         CreateWindowW(L"STATIC", L"目标A", WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, hwnd, (HMENU)ID_LABEL_A, NULL, NULL);
         g_hA = CreateWindowW(L"EDIT", L"192.168.1.1",
@@ -176,14 +205,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_GETMINMAXINFO:
     {
         MINMAXINFO* mmi = (MINMAXINFO*)lParam;
-        mmi->ptMinTrackSize.x = 720;
-        mmi->ptMinTrackSize.y = 500;
+        mmi->ptMinTrackSize.x = 760;
+        mmi->ptMinTrackSize.y = 520;
         return 0;
     }
 
     case WM_DESTROY:
         if (g_hFont) DeleteObject(g_hFont);
         if (g_hFontMono) DeleteObject(g_hFontMono);
+        if (g_hIcon && g_hIcon != LoadIconW(NULL, IDI_APPLICATION)) {
+            DestroyIcon(g_hIcon);
+        }
         PostQuitMessage(0);
         return 0;
     }
@@ -199,7 +231,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, PWSTR lpCmdLine, int n
     WNDCLASSW wc = {0};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
-    wc.lpszClassName = L"LightGuiFrame2";
+    wc.lpszClassName = L"TCPingUIFrame";
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
@@ -211,7 +243,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, PWSTR lpCmdLine, int n
         wc.lpszClassName,
         L"TCPing 双目标对比",
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 920, 680,
+        CW_USEDEFAULT, CW_USEDEFAULT, 980, 720,
         NULL, NULL, hInstance, NULL
     );
 
