@@ -35,7 +35,6 @@ static HWND g_hStart, g_hStop, g_hLog;
 static HANDLE g_hThread = NULL;
 static volatile BOOL g_running = FALSE;
 static HWND g_hwndMain = NULL;
-
 static HFONT g_hFontUI = NULL;
 static HFONT g_hFontLog = NULL;
 
@@ -47,7 +46,6 @@ static DWORD WINAPI PingThread(LPVOID lpParam);
 static void StartPing(void);
 static void StopPing(void);
 static void SetAppIcon(HWND hwnd);
-static void LayoutControls(HWND hwnd);
 static HFONT MakeFont(int height, const wchar_t* face);
 
 static HFONT MakeFont(int height, const wchar_t* face)
@@ -296,69 +294,6 @@ static void StopPing(void)
     AppendLogLine(L"请求停止，等待统计输出...");
 }
 
-static void LayoutControls(HWND hwnd)
-{
-    RECT rc;
-    int w, h;
-    int pad = 12;
-    int top1 = 12;
-    int rowH = 28;
-    int labelW = 60;
-    int portW = 64;
-    int btnW = 84;
-    int gap = 8;
-    int inputH = 24;
-    int logTop = 112;
-    int minLogH = 120;
-
-    GetClientRect(hwnd, &rc);
-    w = rc.right - rc.left;
-    h = rc.bottom - rc.top;
-
-    if (w < 420) w = 420;
-    if (h < 260) h = 260;
-
-    MoveWindow(GetDlgItem(hwnd, IDC_HOST1), 0, 0, 0, 0, FALSE); // no-op for safety
-
-    MoveWindow(GetWindow(hwnd, GW_CHILD), 0, 0, 0, 0, FALSE); // harmless if ignored
-
-    // 目标A
-    MoveWindow(GetParent(g_hHost1), 0, 0, 0, 0, FALSE); // no-op, keep compiler happy style
-
-    // 标签+输入框
-    MoveWindow(GetWindow(hwnd, GW_CHILD), 0, 0, 0, 0, FALSE); // no-op
-
-    // A row
-    MoveWindow(GetDlgItem(hwnd, 0), 0, 0, 0, 0, FALSE); // no-op
-
-    // 手动布局
-    {
-        HWND hLabelA = FindWindowExW(hwnd, NULL, L"STATIC", L"目标A");
-        HWND hLabelB = FindWindowExW(hwnd, hLabelA, L"STATIC", L"目标B");
-        HWND hLabelD = FindWindowExW(hwnd, hLabelB, L"STATIC", L"持续秒数");
-
-        if (hLabelA) MoveWindow(hLabelA, pad, top1 + 2, labelW, inputH, TRUE);
-        if (g_hHost1) MoveWindow(g_hHost1, pad + labelW, top1, w - (pad * 2 + labelW + portW + gap), inputH, TRUE);
-        if (g_hPort1) MoveWindow(g_hPort1, w - pad - portW, top1, portW, inputH, TRUE);
-
-        if (hLabelB) MoveWindow(hLabelB, pad, top1 + rowH + 2, labelW, inputH, TRUE);
-        if (g_hHost2) MoveWindow(g_hHost2, pad + labelW, top1 + rowH, w - (pad * 2 + labelW + portW + gap), inputH, TRUE);
-        if (g_hPort2) MoveWindow(g_hPort2, w - pad - portW, top1 + rowH, portW, inputH, TRUE);
-
-        if (hLabelD) MoveWindow(hLabelD, pad, top1 + rowH * 2 + 2, labelW, inputH, TRUE);
-        if (g_hDur) MoveWindow(g_hDur, pad + labelW, top1 + rowH * 2, 90, inputH, TRUE);
-        if (g_hStart) MoveWindow(g_hStart, pad + labelW + 98, top1 + rowH * 2 - 1, btnW, 26, TRUE);
-        if (g_hStop) MoveWindow(g_hStop, pad + labelW + 98 + btnW + 10, top1 + rowH * 2 - 1, btnW, 26, TRUE);
-    }
-
-    {
-        int logY = logTop;
-        int logH = h - logY - pad;
-        if (logH < minLogH) logH = minLogH;
-        if (g_hLog) MoveWindow(g_hLog, pad, logY, w - pad * 2, logH, TRUE);
-    }
-}
-
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
@@ -404,7 +339,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             20, 130, 760, 380, hwnd, (HMENU)IDC_LOG, NULL, NULL);
 
         g_hFontUI = MakeFont(18, L"Segoe UI");
-        g_hFontLog = MakeFont(18, L"Cascadia Mono");
+        g_hFontLog = MakeFont(20, L"Cascadia Mono");
 
         SendMessageW(g_hHost1, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
         SendMessageW(g_hPort1, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
@@ -415,19 +350,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SendMessageW(g_hStop,  WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
         SendMessageW(g_hLog,   WM_SETFONT, (WPARAM)g_hFontLog, TRUE);
 
-        LayoutControls(hwnd);
-        break;
-    }
-
-    case WM_SIZE:
-        LayoutControls(hwnd);
-        break;
-
-    case WM_GETMINMAXINFO:
-    {
-        MINMAXINFO* mmi = (MINMAXINFO*)lParam;
-        mmi->ptMinTrackSize.x = 560;
-        mmi->ptMinTrackSize.y = 360;
         break;
     }
 
@@ -490,7 +412,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, PWSTR lpCmdLine, int n
     hwnd = CreateWindowW(
         L"TCPingCompareWnd",
         L"TCPing 双目标对比",
-        WS_OVERLAPPEDWINDOW,
+        WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 820, 580,
         NULL, NULL, hInstance, NULL);
 
