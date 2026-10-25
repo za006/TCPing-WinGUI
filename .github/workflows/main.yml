@@ -21,15 +21,20 @@ jobs:
           install: >-
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-binutils
-            mingw-w64-x86_64-winpthreads-git
+            mingw-w64-x86_64-winpthreads
 
-      - name: Build
+      - name: Build resource file
         shell: msys2 {0}
         run: |
-          gcc -O2 -Wall -municode -mwindows main.c -o TCPing-WinGUI.exe -lws2_32 -lcomctl32
+          windres TCPing.rc -O coff -o TCPing_res.o
+
+      - name: Build exe
+        shell: msys2 {0}
+        run: |
+          gcc -O2 -Wall -municode -mwindows main.c TCPing_res.o -o TCPing_GUI.exe -lws2_32 -lcomctl32
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TCPing-WinGUI
-          path: TCPing-WinGUI.exe
+          name: TCPing_GUI
+          path: TCPing_GUI.exe
