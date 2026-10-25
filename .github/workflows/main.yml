@@ -1,0 +1,59 @@
+name: build-windows
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate version
+        id: version
+        shell: bash
+        run: |
+          DATE=$(date -u +%Y%m%d)
+          VERSION="${DATE}A-${{ github.run_number }}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Install MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+            mingw-w64-x86_64-winpthreads
+
+      - name: Build exe
+        shell: msys2 {0}
+        run: |
+          gcc -O2 -Wall -municode -mwindows main.c -o TCPing_GUI.exe -lws2_32 -lshell32
+
+      - name: Prepare package
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item TCPing_GUI.exe release\
+          Copy-Item main.js release\
+          if (Test-Path README.md) { Copy-Item README.md release\ }
+
+      - name: Create zip
+        shell: powershell
+        run: |
+          Compress-Archive -Path release\* -DestinationPath "TCPing_GUI-${{ steps.version.outputs.version }}.zip" -Force
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          files: TCPing_GUI-${{ steps.version.outputs.version }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
