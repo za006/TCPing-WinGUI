@@ -22,6 +22,8 @@
 #define IDC_STOP      1007
 #define IDC_LOG       1008
 
+#define APP_ICON_ID   101
+
 typedef struct {
     wchar_t host1[256];
     wchar_t host2[256];
@@ -39,6 +41,7 @@ static HWND g_hHost1, g_hPort1, g_hHost2, g_hPort2, g_hDur;
 static HWND g_hStart, g_hStop, g_hLog;
 static HANDLE g_hThread = NULL;
 static volatile BOOL g_running = FALSE;
+static HWND g_hwndMain = NULL;
 
 static void AppendLogLine(const wchar_t* line);
 static void BuildBar(wchar_t* out, int maxCount, DWORD latency);
@@ -47,6 +50,23 @@ static BOOL TCPPing(const wchar_t* host, int port, DWORD* latencyMs);
 static DWORD WINAPI PingThread(LPVOID lpParam);
 static void StartPing(void);
 static void StopPing(void);
+static void SetAppIcon(HWND hwnd);
+
+static void SetAppIcon(HWND hwnd)
+{
+    HICON hIcon = NULL;
+
+    hIcon = (HICON)LoadImageW(GetModuleHandleW(NULL),
+        MAKEINTRESOURCEW(APP_ICON_ID),
+        IMAGE_ICON,
+        0, 0,
+        LR_DEFAULTSIZE);
+
+    if (hIcon) {
+        SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
+    }
+}
 
 static void AppendLogLine(const wchar_t* line)
 {
@@ -84,7 +104,7 @@ static BOOL TCPPing(const wchar_t* host, int port, DWORD* latencyMs)
     ZeroMemory(&hints, sizeof(hints));
     wsprintfW(portStr, L"%d", port);
 
-    hints.ai_family = AF_UNSPEC;      // IPv4 + IPv6
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
@@ -120,6 +140,12 @@ static DWORD WINAPI PingThread(LPVOID lpParam)
     PingParams* p = (PingParams*)lpParam;
     DWORD startTick = GetTickCount();
 
+    int sentA = 0, okA = 0;
+    int sentB = 0, okB = 0;
+    DWORD sumA = 0, sumB = 0;
+    DWORD minA = 0xFFFFFFFF, minB = 0xFFFFFFFF;
+    DWORD maxA = 0, maxB = 0;
+
     while (g_running && (GetTickCount() - startTick) < (DWORD)(p->durationSec * 1000)) {
         SYSTEMTIME st;
         wchar_t timeText[32];
@@ -133,6 +159,23 @@ static DWORD WINAPI PingThread(LPVOID lpParam)
 
         ra.ok = TCPPing(p->host1, p->port1, &ra.latency);
         rb.ok = TCPPing(p->host2, p->port2, &rb.latency);
+
+        sentA++;
+        sentB++;
+
+        if (ra.ok) {
+            okA++;
+            sumA += ra.latency;
+            if (ra.latency < minA) minA = ra.latency;
+            if (ra.latency > maxA) maxA = ra.latency;
+        }
+
+        if (rb.ok) {
+            okB++;
+            sumB += rb.latency;
+            if (rb.latency < minB) minB = rb.latency;
+            if (rb.latency > maxB) maxB = rb.latency;
+        }
 
         BuildBar(barA, 40, ra.ok ? ra.latency : 0);
         BuildBar(barB, 40, rb.ok ? rb.latency : 0);
@@ -164,6 +207,25 @@ static DWORD WINAPI PingThread(LPVOID lpParam)
 
         AppendLogLine(line);
         Sleep(1000);
+    }
+
+    {
+        wchar_t stat[1024];
+        double lossA = sentA ? (100.0 * (sentA - okA) / sentA) : 0.0;
+        double lossB = sentB ? (100.0 * (sentB - okB) / sentB) : 0.0;
+        double avgA = okA ? (double)sumA / okA : 0.0;
+        double avgB = okB ? (double)sumB / okB : 0.0;
+
+        wsprintfW(stat,
+            L"\r\n===== 统计 =====\r\n"
+            L"A目标: 发送=%d, 接收=%d, 丢失=%d(%.0f%%), 最短=%lu, 最长=%lu, 平均=%.0fms\r\n"
+            L"B目标: 发送=%d, 接收=%d, 丢失=%d(%.0f%%), 最短=%lu, 最长=%lu, 平均=%.0fms\r\n",
+            sentA, okA, sentA - okA, lossA,
+            minA == 0xFFFFFFFF ? 0 : minA, maxA, avgA,
+            sentB, okB, sentB - okB, lossB,
+            minB == 0xFFFFFFFF ? 0 : minB, maxB, avgB);
+
+        AppendLogLine(stat);
     }
 
     free(p);
@@ -199,11 +261,12 @@ static void StartPing(void)
         params->durationSec = 51;
 
     if (params->host1[0] == 0 || params->host2[0] == 0 || params->port1 <= 0 || params->port2 <= 0) {
-        MessageBoxW(NULL, L"请输入两个目标和有效端口", L"提示", MB_OK | MB_ICONINFORMATION);
+        MessageBoxW(g_hwndMain, L"请输入两个目标和有效端口", L"提示", MB_OK | MB_ICONINFORMATION);
         free(params);
         return;
     }
 
+    AppendLogLine(L"开始测试...");
     g_running = TRUE;
     EnableWindow(g_hStart, FALSE);
     EnableWindow(g_hStop, TRUE);
@@ -220,6 +283,7 @@ static void StartPing(void)
 static void StopPing(void)
 {
     g_running = FALSE;
+    AppendLogLine(L"请求停止，等待统计输出...");
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -227,6 +291,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg) {
     case WM_CREATE:
     {
+        g_hwndMain = hwnd;
+        SetAppIcon(hwnd);
+
         CreateWindowW(L"STATIC", L"目标A", WS_CHILD | WS_VISIBLE,
             20, 20, 60, 20, hwnd, NULL, NULL, NULL);
         g_hHost1 = CreateWindowW(L"EDIT", L"127.0.0.1",
@@ -260,12 +327,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         g_hLog = CreateWindowW(L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE |
-            ES_AUTOVSCROLL | WS_VSCROLL | ES_READONLY,
+            ES_AUTOVSCROLL | WS_VSCROLL | ES_READONLY | ES_WANTRETURN,
             20, 130, 760, 380, hwnd, (HMENU)IDC_LOG, NULL, NULL);
 
         SendMessageW(g_hLog, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
         break;
     }
+
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case IDC_START:
@@ -280,12 +348,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_DESTROY:
         g_running = FALSE;
         if (g_hThread) {
-            WaitForSingleObject(g_hThread, 2000);
+            WaitForSingleObject(g_hThread, 3000);
             CloseHandle(g_hThread);
             g_hThread = NULL;
         }
         PostQuitMessage(0);
         break;
+
     default:
         return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
@@ -297,15 +366,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, PWSTR lpCmdLine, int n
     WNDCLASSW wc;
     HWND hwnd;
     MSG msg;
+    WSAData wsa;
 
     ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = L"TCPingCompareWnd";
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.hIcon = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(APP_ICON_ID), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+    wc.hIconSm = wc.hIcon;
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
 
-    RegisterClassW(&wc);
+    if (!RegisterClassW(&wc))
+        return 0;
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+        return 0;
 
     hwnd = CreateWindowW(
         L"TCPingCompareWnd",
@@ -314,14 +390,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, PWSTR lpCmdLine, int n
         CW_USEDEFAULT, CW_USEDEFAULT, 820, 580,
         NULL, NULL, hInstance, NULL);
 
-    if (!hwnd)
+    if (!hwnd) {
+        WSACleanup();
         return 0;
+    }
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
-
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
 
     while (GetMessageW(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
