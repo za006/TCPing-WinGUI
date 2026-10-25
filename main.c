@@ -1,17 +1,10 @@
-#define _WIN32_WINNT 0x0601
-#define UNICODE
-#define _UNICODE
-
-#include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #include <commctrl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
-
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "comctl32.lib")
 
 #define IDC_HOST1     1001
 #define IDC_PORT1     1002
@@ -54,9 +47,8 @@ static void SetAppIcon(HWND hwnd);
 
 static void SetAppIcon(HWND hwnd)
 {
-    HICON hIcon = NULL;
-
-    hIcon = (HICON)LoadImageW(GetModuleHandleW(NULL),
+    HICON hIcon = (HICON)LoadImageW(
+        GetModuleHandleW(NULL),
         MAKEINTRESOURCEW(APP_ICON_ID),
         IMAGE_ICON,
         0, 0,
@@ -366,7 +358,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, PWSTR lpCmdLine, int n
     WNDCLASSW wc;
     HWND hwnd;
     MSG msg;
-    WSAData wsa;
+    WSADATA wsa;
 
     ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc = WndProc;
@@ -374,7 +366,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, PWSTR lpCmdLine, int n
     wc.lpszClassName = L"TCPingCompareWnd";
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     wc.hIcon = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(APP_ICON_ID), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
-    wc.hIconSm = wc.hIcon;
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
 
     if (!RegisterClassW(&wc))
