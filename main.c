@@ -1,10 +1,5 @@
-#define UNICODE
-#define _UNICODE
-
 #include <windows.h>
 #include <commctrl.h>
-
-#pragma comment(lib, "comctl32.lib")
 
 #define ID_EDIT_A     1001
 #define ID_EDIT_APORT 1002
@@ -37,10 +32,15 @@ static HFONT MakeFont(int h, const wchar_t* face)
 
 static void ApplyFonts(void)
 {
-    HWND ctrls[] = { g_hA, g_hAP, g_hB, g_hBP, g_hT, g_hBtnOK, g_hBtnStop, g_hList, g_hLog };
-    for (int i = 0; i < 9; i++) {
-        SendMessageW(ctrls[i], WM_SETFONT, (WPARAM)(i >= 7 ? g_hFontMono : g_hFont), TRUE);
-    }
+    SendMessageW(g_hA, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+    SendMessageW(g_hAP, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+    SendMessageW(g_hB, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+    SendMessageW(g_hBP, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+    SendMessageW(g_hT, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+    SendMessageW(g_hBtnOK, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+    SendMessageW(g_hBtnStop, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+    SendMessageW(g_hList, WM_SETFONT, (WPARAM)g_hFontMono, TRUE);
+    SendMessageW(g_hLog, WM_SETFONT, (WPARAM)g_hFontMono, TRUE);
 }
 
 static void InitList(HWND hList)
@@ -53,7 +53,10 @@ static void InitList(HWND hList)
     col.pszText = L"B";    col.cx = 160; ListView_InsertColumn(hList, 2, &col);
     col.pszText = L"备注";  col.cx = 120; ListView_InsertColumn(hList, 3, &col);
 
-    ListView_SetExtendedListViewStyle(hList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+    ListView_SetExtendedListViewStyle(
+        hList,
+        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER
+    );
 }
 
 static void Layout(HWND hwnd)
@@ -151,6 +154,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_hList = CreateWindowW(WC_LISTVIEWW, L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL,
             0, 0, 0, 0, hwnd, (HMENU)ID_LIST, NULL, NULL);
+
         g_hLog = CreateWindowW(L"EDIT", L"准备就绪。\r\n",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE |
             ES_AUTOVSCROLL | WS_VSCROLL | ES_READONLY | ES_NOHIDESEL,
@@ -199,7 +203,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, PWSTR lpCmdLine, int n
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
-    wc.hIconSm = LoadIconW(NULL, IDI_APPLICATION);
 
     if (!RegisterClassW(&wc))
         return 0;
