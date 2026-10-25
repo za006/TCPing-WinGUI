@@ -1,0 +1,35 @@
+name: build-windows
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+            mingw-w64-x86_64-winpthreads-git
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          gcc -O2 -Wall -municode -mwindows main.c -o TCPing-WinGUI.exe -lws2_32 -lcomctl32
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TCPing-WinGUI
+          path: TCPing-WinGUI.exe
