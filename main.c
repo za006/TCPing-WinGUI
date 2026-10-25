@@ -296,7 +296,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         CreateWindowW(L"STATIC", L"目标A", WS_CHILD | WS_VISIBLE,
             20, 20, 60, 20, hwnd, NULL, NULL, NULL);
-        g_hHost1 = CreateWindowW(L"EDIT", L"127.0.0.1",
+        g_hHost1 = CreateWindowW(L"EDIT", L"192.168.1.1",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
             80, 18, 220, 24, hwnd, (HMENU)IDC_HOST1, NULL, NULL);
         g_hPort1 = CreateWindowW(L"EDIT", L"80",
@@ -305,7 +305,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         CreateWindowW(L"STATIC", L"目标B", WS_CHILD | WS_VISIBLE,
             20, 55, 60, 20, hwnd, NULL, NULL, NULL);
-        g_hHost2 = CreateWindowW(L"EDIT", L"1.1.1.1",
+        g_hHost2 = CreateWindowW(L"EDIT", L"z.cn",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
             80, 53, 220, 24, hwnd, (HMENU)IDC_HOST2, NULL, NULL);
         g_hPort2 = CreateWindowW(L"EDIT", L"443",
