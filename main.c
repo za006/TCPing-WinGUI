@@ -1,254 +1,257 @@
-#define _CRT_SECURE_NO_WARNINGS
-
+// main.c
+#define UNICODE
+#define _UNICODE
+#include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <windows.h>
+#include <shellapi.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
 
-extern HINSTANCE g_hInst;
-extern HWND g_hWnd;
-extern HWND g_hList;
-extern HWND g_hStatus;
-extern HWND g_hEditA;
-extern HWND g_hEditPortA;
-extern HWND g_hEditB;
-extern HWND g_hEditPortB;
-extern HWND g_hEditDuration;
-extern HWND g_hBtnStart;
-extern HWND g_hBtnStop;
-extern HWND g_hBtnWeb;
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "shell32.lib")
 
-#define WM_APP_LOG          (WM_APP + 1)
-#define WM_APP_ROW          (WM_APP + 2)
-#define WM_APP_DONE         (WM_APP + 3)
-#define WM_APP_STATUS       (WM_APP + 4)
+#ifndef WM_APP_LOG
+#define WM_APP_LOG   (WM_APP + 1)
+#endif
+#ifndef WM_APP_ROW
+#define WM_APP_ROW   (WM_APP + 2)
+#endif
+#ifndef WM_APP_STATUS
+#define WM_APP_STATUS (WM_APP + 3)
+#endif
+#ifndef WM_APP_DONE
+#define WM_APP_DONE  (WM_APP + 4)
+#endif
 
-typedef struct {
-    char hostA[256];
-    int portA;
-    char hostB[256];
-    int portB;
-    int durationSec;
-    volatile LONG stopFlag;
-    HANDLE hThread;
-} APPSTATE;
+typedef struct TCPING_ROW {
+    int     id;
+    wchar_t target[256];
+    int     sent;
+    int     received;
+    int     lost;
+    int     last_ms;
+    int     min_ms;
+    int     avg_ms;
+    int     max_ms;
+    int     pct;
+    wchar_t state[64];
+} TCPING_ROW;
 
-typedef struct {
-    char timeText[32];
-    char aText[32];
-    char bText[32];
-    char diffText[32];
-    int aMs;
-    int bMs;
-    int diffMs;
-} RESULTROW;
+HINSTANCE g_hInst = NULL;
+HWND g_hwndMain = NULL;
 
-static APPSTATE g_state = {0};
+static HANDLE g_hThread = NULL;
+static volatile LONG g_running = 0;
+static volatile LONG g_stop = 0;
 
-static void GetNowText(char* buf, size_t cb) {
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    snprintf(buf, cb, "%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+static const wchar_t* g_targets[] = {
+    L"127.0.0.1:80",
+    L"127.0.0.1:8080",
+    L"localhost:3000"
+};
+static const int g_targetCount = sizeof(g_targets) / sizeof(g_targets[0]);
+
+static void PostLog(const wchar_t* text)
+{
+    if (g_hwndMain && text) PostMessageW(g_hwndMain, WM_APP_LOG, 0, (LPARAM)text);
 }
 
-static void MsToText(int ms, char* buf, size_t cb) {
-    if (ms < 0) {
-        snprintf(buf, cb, "timeout");
-    } else {
-        snprintf(buf, cb, "%d", ms);
-    }
+static void PostStatus(const wchar_t* text)
+{
+    if (g_hwndMain && text) PostMessageW(g_hwndMain, WM_APP_STATUS, 0, (LPARAM)text);
 }
 
-static void PostLog(const char* s) {
-    if (!s) return;
-    char* dup = _strdup(s);
-    if (dup) PostMessageA(g_hWnd, WM_APP_LOG, 0, (LPARAM)dup);
-}
-
-static void PostStatus(const char* s) {
-    if (!s) return;
-    char* dup = _strdup(s);
-    if (dup) PostMessageA(g_hWnd, WM_APP_STATUS, 0, (LPARAM)dup);
-}
-
-static int TcpPingOnce(const char* host, int port, int timeoutMs) {
-    struct addrinfo hints, *res = NULL, *p = NULL;
-    char portStr[16];
+static DWORD TcpConnectOnce(const wchar_t* host, unsigned short port)
+{
+    struct addrinfoW hints, *res = NULL, *p = NULL;
+    SOCKET s = INVALID_SOCKET;
+    DWORD best = (DWORD)-1;
+    LARGE_INTEGER f, t1, t2;
+    int ok = 0;
 
     ZeroMemory(&hints, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
-    snprintf(portStr, sizeof(portStr), "%d", port);
+    wchar_t portbuf[16];
+    swprintf(portbuf, 16, L"%u", port);
 
-    if (getaddrinfo(host, portStr, &hints, &res) != 0) {
-        return -1;
-    }
+    if (QueryPerformanceFrequency(&f) == 0) return (DWORD)-1;
 
-    for (p = res; p; p = p->ai_next) {
-        SOCKET s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) return (DWORD)-1;
+
+    if (GetAddrInfoW(host, portbuf, &hints, &res) != 0) return (DWORD)-1;
+
+    for (p = res; p != NULL; p = p->ai_next) {
+        s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
         if (s == INVALID_SOCKET) continue;
 
-        u_long nb = 1;
-        ioctlsocket(s, FIONBIO, &nb);
+        u_long nonblocking = 1;
+        ioctlsocket(s, FIONBIO, &nonblocking);
 
-        LARGE_INTEGER freq, t1, t2;
-        QueryPerformanceFrequency(&freq);
         QueryPerformanceCounter(&t1);
-
-        int c = connect(s, p->ai_addr, (int)p->ai_addrlen);
-        if (c == 0) {
+        int r = connect(s, p->ai_addr, (int)p->ai_addrlen);
+        if (r == 0) {
             QueryPerformanceCounter(&t2);
-            closesocket(s);
-            freeaddrinfo(res);
-            return (int)((t2.QuadPart - t1.QuadPart) * 1000 / freq.QuadPart);
-        }
+            ok = 1;
+        } else {
+            int err = WSAGetLastError();
+            if (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS || err == WSAEINVAL) {
+                fd_set wfds;
+                struct timeval tv;
+                FD_ZERO(&wfds);
+                FD_SET(s, &wfds);
+                tv.tv_sec = 1;
+                tv.tv_usec = 0;
 
-        int wsaErr = WSAGetLastError();
-        if (wsaErr != WSAEWOULDBLOCK && wsaErr != WSAEINPROGRESS) {
-            closesocket(s);
-            continue;
-        }
-
-        fd_set wfds, efds;
-        FD_ZERO(&wfds);
-        FD_ZERO(&efds);
-        FD_SET(s, &wfds);
-        FD_SET(s, &efds);
-
-        struct timeval tv;
-        tv.tv_sec = timeoutMs / 1000;
-        tv.tv_usec = (timeoutMs % 1000) * 1000;
-
-        int sel = select(0, NULL, &wfds, &efds, &tv);
-        if (sel > 0 && FD_ISSET(s, &wfds)) {
-            int so_error = 0;
-            int len = sizeof(so_error);
-            getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&so_error, &len);
-            if (so_error == 0) {
-                QueryPerformanceCounter(&t2);
-                closesocket(s);
-                freeaddrinfo(res);
-                return (int)((t2.QuadPart - t1.QuadPart) * 1000 / freq.QuadPart);
+                r = select(0, NULL, &wfds, NULL, &tv);
+                if (r > 0) {
+                    int soerr = 0;
+                    int slen = sizeof(soerr);
+                    getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&soerr, &slen);
+                    if (soerr == 0) {
+                        QueryPerformanceCounter(&t2);
+                        ok = 1;
+                    }
+                }
             }
         }
 
         closesocket(s);
+        s = INVALID_SOCKET;
+
+        if (ok) {
+            double ms = (double)(t2.QuadPart - t1.QuadPart) * 1000.0 / (double)f.QuadPart;
+            best = (DWORD)(ms + 0.5);
+            break;
+        }
     }
 
-    if (res) freeaddrinfo(res);
-    return -1;
+    if (res) FreeAddrInfoW(res);
+    return best;
 }
 
-static DWORD WINAPI WorkerThreadProc(LPVOID lpParam) {
-    APPSTATE* st = (APPSTATE*)lpParam;
-    WSADATA wsa;
+static void SendRow(HWND hwnd, TCPING_ROW* row)
+{
+    if (!hwnd || !row) return;
+    PostMessageW(hwnd, WM_APP_ROW, 0, (LPARAM)row);
+}
 
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        PostLog("WSAStartup failed");
-        PostMessageA(g_hWnd, WM_APP_DONE, 0, 0);
+static DWORD WINAPI TcpingThread(LPVOID lp)
+{
+    HWND hwnd = (HWND)lp;
+    WSADATA wsa;
+    const int durationSec = 50;
+    const int intervalMs = 1000;
+    TCPING_ROW rows[sizeof(g_targets) / sizeof(g_targets[0])];
+    int i;
+
+    InterlockedExchange(&g_running, 1);
+    InterlockedExchange(&g_stop, 0);
+
+    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
+        PostStatus(L"WSAStartup failed");
+        InterlockedExchange(&g_running, 0);
+        PostMessageW(hwnd, WM_APP_DONE, 0, 0);
         return 0;
     }
 
-    {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "Start: %s:%d vs %s:%d, duration=%ds",
-                 st->hostA, st->portA, st->hostB, st->portB, st->durationSec);
-        PostLog(buf);
+    ZeroMemory(rows, sizeof(rows));
+    for (i = 0; i < g_targetCount; ++i) {
+        rows[i].id = i;
+        lstrcpynW(rows[i].target, g_targets[i], 255);
+        rows[i].min_ms = 0x7fffffff;
+        rows[i].state[0] = 0;
     }
 
-    int elapsed = 0;
-    while (elapsed < st->durationSec) {
-        if (InterlockedCompareExchange(&st->stopFlag, 0, 0) != 0) break;
+    PostStatus(L"运行中...");
+    PostLog(L"开始 TCPing");
 
-        int aMs = TcpPingOnce(st->hostA, st->portA, 2000);
-        int bMs = TcpPingOnce(st->hostB, st->portB, 2000);
+    for (int sec = 0; sec < durationSec && !g_stop; ++sec) {
+        for (i = 0; i < g_targetCount && !g_stop; ++i) {
+            wchar_t host[256];
+            unsigned short port = 0;
+            DWORD ms = (DWORD)-1;
+            wchar_t* colon;
 
-        RESULTROW* r = (RESULTROW*)malloc(sizeof(RESULTROW));
-        if (r) {
-            ZeroMemory(r, sizeof(RESULTROW));
-            GetNowText(r->timeText, sizeof(r->timeText));
-            MsToText(aMs, r->aText, sizeof(r->aText));
-            MsToText(bMs, r->bText, sizeof(r->bText));
+            lstrcpynW(host, rows[i].target, 255);
+            colon = wcsrchr(host, L':');
+            if (colon) {
+                *colon = 0;
+                port = (unsigned short)_wtoi(colon + 1);
+            } else {
+                port = 80;
+            }
 
-            if (aMs >= 0 && bMs >= 0) r->diffMs = abs(aMs - bMs);
-            else r->diffMs = -1;
+            rows[i].sent++;
 
-            MsToText(r->diffMs, r->diffText, sizeof(r->diffText));
-            r->aMs = aMs;
-            r->bMs = bMs;
+            ms = TcpConnectOnce(host, port);
+            if (ms != (DWORD)-1) {
+                rows[i].received++;
+                rows[i].last_ms = (int)ms;
+                if (rows[i].last_ms < rows[i].min_ms) rows[i].min_ms = rows[i].last_ms;
+                if (rows[i].last_ms > rows[i].max_ms) rows[i].max_ms = rows[i].last_ms;
+                rows[i].avg_ms = (rows[i].avg_ms * (rows[i].received - 1) + rows[i].last_ms) / rows[i].received;
+                rows[i].lost = (rows[i].sent - rows[i].received) * 100 / rows[i].sent;
+                swprintf(rows[i].state, 64, L"OK");
+                rows[i].pct = rows[i].received * 100 / rows[i].sent;
+            } else {
+                rows[i].lost = (rows[i].sent - rows[i].received) * 100 / rows[i].sent;
+                rows[i].pct = rows[i].received * 100 / rows[i].sent;
+                lstrcpynW(rows[i].state, L"TIMEOUT", 63);
+            }
 
-            PostMessageA(g_hWnd, WM_APP_ROW, 0, (LPARAM)r);
+            SendRow(hwnd, &rows[i]);
         }
 
-        {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "Running... %d/%d sec", elapsed + 1, st->durationSec);
-            PostStatus(buf);
-        }
-
-        Sleep(1000);
-        elapsed++;
+        Sleep(intervalMs);
     }
 
+    for (i = 0; i < g_targetCount; ++i) {
+        SendRow(hwnd, &rows[i]);
+    }
+
+    PostLog(L"测试结束");
+    PostStatus(L"完成");
     WSACleanup();
-    PostMessageA(g_hWnd, WM_APP_DONE, 0, 0);
+
+    InterlockedExchange(&g_running, 0);
+    PostMessageW(hwnd, WM_APP_DONE, 0, 0);
     return 0;
 }
 
-void StartWork(void) {
-    char buf[256];
+void StartTcping(HWND hwnd)
+{
+    if (InterlockedCompareExchange(&g_running, 1, 0) != 0) return;
 
-    GetWindowTextA(g_hEditA, g_state.hostA, sizeof(g_state.hostA));
-    GetWindowTextA(g_hEditB, g_state.hostB, sizeof(g_state.hostB));
-
-    GetWindowTextA(g_hEditPortA, buf, sizeof(buf));
-    g_state.portA = atoi(buf);
-
-    GetWindowTextA(g_hEditPortB, buf, sizeof(buf));
-    g_state.portB = atoi(buf);
-
-    GetWindowTextA(g_hEditDuration, buf, sizeof(buf));
-    g_state.durationSec = atoi(buf);
-
-    if (g_state.durationSec <= 0) g_state.durationSec = 50;
-    if (g_state.portA <= 0) g_state.portA = 80;
-    if (g_state.portB <= 0) g_state.portB = 53;
-
-    InterlockedExchange(&g_state.stopFlag, 0);
-
-    EnableWindow(g_hBtnStart, FALSE);
-    EnableWindow(g_hBtnStop, TRUE);
-    EnableWindow(g_hEditA, FALSE);
-    EnableWindow(g_hEditPortA, FALSE);
-    EnableWindow(g_hEditB, FALSE);
-    EnableWindow(g_hEditPortB, FALSE);
-    EnableWindow(g_hEditDuration, FALSE);
-
-    PostStatus("Starting...");
-
-    g_state.hThread = CreateThread(NULL, 0, WorkerThreadProc, &g_state, 0, NULL);
-    if (!g_state.hThread) {
-        PostStatus("Failed to start worker");
-        EnableWindow(g_hBtnStart, TRUE);
-        EnableWindow(g_hBtnStop, FALSE);
-        EnableWindow(g_hEditA, TRUE);
-        EnableWindow(g_hEditPortA, TRUE);
-        EnableWindow(g_hEditB, TRUE);
-        EnableWindow(g_hEditPortB, TRUE);
-        EnableWindow(g_hEditDuration, TRUE);
-        return;
+    g_hwndMain = hwnd;
+    if (g_hThread) {
+        CloseHandle(g_hThread);
+        g_hThread = NULL;
     }
-
-    CloseHandle(g_state.hThread);
-    g_state.hThread = NULL;
+    g_hThread = CreateThread(NULL, 0, TcpingThread, hwnd, 0, NULL);
+    if (!g_hThread) {
+        InterlockedExchange(&g_running, 0);
+        PostStatus(L"线程创建失败");
+    } else {
+        CloseHandle(g_hThread);
+        g_hThread = NULL;
+    }
 }
 
-void StopWork(void) {
-    InterlockedExchange(&g_state.stopFlag, 1);
-    PostStatus("Stopping...");
+void StopTcping(void)
+{
+    InterlockedExchange(&g_stop, 1);
+    if (g_hThread) {
+        WaitForSingleObject(g_hThread, 200);
+        CloseHandle(g_hThread);
+        g_hThread = NULL;
+    }
+    InterlockedExchange(&g_running, 0);
 }
 
+void OpenWebInterface(void)
+{
+    ShellExecuteW(NULL, L"open", L"http://127.0.0.1:8080/", NULL, NULL, SW_SHOWNORMAL);
+}
