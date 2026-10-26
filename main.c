@@ -1,534 +1,325 @@
 #define _WIN32_WINNT 0x0601
 #include <winsock2.h>
 #include <windows.h>
-#include <ws2tcpip.h>
 #include <shellapi.h>
-#include <process.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
-#include <time.h>
+#include <process.h>
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "shell32.lib")
 
 #define PORT 38000
-#define MAX_ROWS 256
-#define MAX_LOGS 256
-#define MAX_DEBUG 256
-#define BUF_SIZE 8192
 #define WM_TRAYICON (WM_USER + 1)
+#define ID_SHOW  1001
+#define ID_START 1002
+#define ID_STOP  1003
+#define ID_EXIT  1004
+
+static HWND g_hwnd;
+static volatile LONG g_run = 1;
+static volatile LONG g_ping = 0;
+static volatile LONG g_ready = 0;
+static unsigned short g_port = PORT;
+static HANDLE g_srv_th = NULL;
+static HANDLE g_ping_th = NULL;
+static HANDLE g_mtx = NULL;
+
+static char g_debug[16384];
+static int g_dbg_pos = 0;
+static char g_oper[8192];
+static int g_op_pos = 0;
+static char g_last[128] = "none";
+
+static char g_a[256] = "1.1.1.1";
+static char g_b[256] = "8.8.8.8";
+static int g_pa = 80, g_pb = 80, g_dur = 10;
 
 typedef struct {
-    char time[32];
-    char a[32];
-    char b[32];
-    char note[128];
+    char t[16], a[32], b[32], note[64];
+    int ams, bms;
 } Row;
 
-static HWND g_hwnd = NULL;
-static HMENU g_menu = NULL;
-static NOTIFYICONDATAA g_nid = {0};
+static Row g_rows[256];
+static int g_row_n = 0;
 
-static volatile LONG g_running = 0;
-static HANDLE g_worker = NULL;
-static HANDLE g_stopEvent = NULL;
+static const char *HTML =
+"<!doctype html><html><head><meta charset='utf-8'>"
+"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>TCPing GUI</title>"
+"<style>"
+"body{font:12px Segoe UI,Arial;background:#f6f8fb;margin:12px;color:#1f2937}"
+".w{max-width:1200px;margin:auto}.c{background:#fff;border:1px solid #dbe3ee;border-radius:8px;padding:10px;margin:0 0 10px}"
+".r{display:flex;gap:8px;flex-wrap:wrap;align-items:end}"
+"label{display:block;margin-bottom:4px;color:#4b5563}input{height:28px;border:1px solid #cfd8e3;border-radius:6px;padding:0 8px}"
+"button{height:30px;border:1px solid #cfd8e3;background:#f8fafc;border-radius:6px;padding:0 12px}"
+".s{display:flex;gap:10px;flex-wrap:wrap}.p{background:#eef4ff;border:1px solid #d7e3f3;border-radius:999px;padding:2px 8px}"
+"table{width:100%;border-collapse:collapse}th,td{padding:5px 6px;border-bottom:1px solid #e5eaf1;text-align:left}"
+"th{background:#f8fafc;position:sticky;top:0}.bars{display:flex;gap:2px;align-items:end;height:18px}"
+".a{width:3px;background:#2b7cff}.b{width:3px;background:#ff8a00}"
+".box{height:140px;overflow:auto;white-space:pre-wrap;background:#fff;border:1px solid #dbe3ee;border-radius:6px;padding:8px}"
+".dbg{background:#fff}.small{width:88px}.mid{width:150px}.wide{width:220px}"
+"</style></head><body><div class='w' id='app'></div><script src='/main.js'></script></body></html>";
 
-static CRITICAL_SECTION g_lock;
+static const char *JS =
+"const $=id=>document.getElementById(id);"
+"function bar(v,c){v=v>9998?0:v;let h=Math.max(2,Math.min(18,Math.round(v/10)));return `<div class='bars'><div class='${c}' style='height:${h}px'></div></div>`}"
+"function row(r){return `<tr><td>${r.t}</td><td>${r.a}</td><td>${r.b}</td><td>${bar(r.ams,'a')}</td><td>${bar(r.bms,'b')}</td><td>${r.note}</td></tr>`}"
+"async function api(u){return await fetch(u,{cache:'no-store'})}"
+"async function refresh(){let s=await (await api('/api/status')).json();"
+"$('st').textContent='Status: '+(s.running?'Running':'Stopped');"
+"$('sa').textContent='A: '+s.a_stats; $('sb').textContent='B: '+s.b_stats; $('sl').textContent='Last log: '+s.last_log;"
+"$('op').textContent=s.op_logs||''; $('dbg').textContent=s.debug||'';"
+"$('tb').innerHTML=(s.rows||[]).map(row).join('');}"
+"async function start(){let q=`/api/start?a=${encodeURIComponent($('a').value)}&pa=${$('pa').value}&b=${encodeURIComponent($('b').value)}&pb=${$('pb').value}&d=${$('d').value}`;await api(q);refresh();}"
+"async function stop(){await api('/api/stop');refresh();}"
+"document.getElementById('app').innerHTML=`"
+"<div class='c'><div class='r'>"
+"<div><label>Target A</label><input id='a' class='wide' value='1.1.1.1'></div>"
+"<div><label>Port A</label><input id='pa' class='small' type='number' value='80'></div>"
+"<div><label>Target B</label><input id='b' class='wide' value='8.8.8.8'></div>"
+"<div><label>Port B</label><input id='pb' class='small' type='number' value='80'></div>"
+"<div><label>Duration</label><input id='d' class='small' type='number' value='10'></div>"
+"<div><button onclick='start()'>Start</button></div><div><button onclick='stop()'>Stop</button></div><div><button onclick='refresh()'>Refresh</button></div>"
+"</div></div>"
+"<div class='c'><div class='s'><span class='p' id='st'>Status: -</span><span class='p' id='sa'>A: -</span><span class='p' id='sb'>B: -</span><span class='p' id='sl'>Last log: -</span></div></div>"
+"<div class='c'><table><thead><tr><th>Time</th><th>A</th><th>B</th><th>A Bar</th><th>B Bar</th><th>Note</th></tr></thead><tbody id='tb'></tbody></table></div>"
+"<div class='c'><div>Operational Logs</div><div id='op' class='box'></div></div>"
+"<div class='c'><div>Debug Log</div><div id='dbg' class='box dbg'></div></div></div>`;"
+"setInterval(refresh,1000);refresh();";
 
-static Row g_rows[MAX_ROWS];
-static int g_rowCount = 0;
+static void lock(void){WaitForSingleObject(g_mtx,INFINITE);}
+static void unlock(void){ReleaseMutex(g_mtx);}
 
-static char g_logs[MAX_LOGS][256];
-static int g_logCount = 0;
-
-static char g_debug[MAX_DEBUG][256];
-static int g_debugCount = 0;
-
-static char g_aHost[128] = "127.0.0.1";
-static char g_bHost[128] = "8.8.8.8";
-static int g_aPort = 80;
-static int g_bPort = 80;
-static int g_duration = 60;
-
-static const char *g_indexHtml =
-"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=1280,minimum-scale=0.2'><title>TCPing GUI</title><script src='/main.js'></script></head><body></body></html>";
-
-static void add_logf(const char *fmt, ...) {
-    char buf[256];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    EnterCriticalSection(&g_lock);
-    if (g_logCount >= MAX_LOGS) {
-        memmove(g_logs, g_logs + 1, sizeof(g_logs[0]) * (MAX_LOGS - 1));
-        g_logCount = MAX_LOGS - 1;
-    }
-    lstrcpynA(g_logs[g_logCount++], buf, 255);
-    LeaveCriticalSection(&g_lock);
+static void addbuf(char *buf,int *pos,int cap,const char *fmt,...){
+    char t[512]; va_list ap; va_start(ap,fmt); vsnprintf(t,sizeof(t),fmt,ap); va_end(ap);
+    int n=(int)strlen(t); if(*pos+n+1>=cap){*pos=0; buf[0]=0;} memcpy(buf+*pos,t,n); *pos+=n; buf[*pos]=0;
 }
 
-static void add_debugf(const char *fmt, ...) {
-    char buf[256];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    EnterCriticalSection(&g_lock);
-    if (g_debugCount >= MAX_DEBUG) {
-        memmove(g_debug, g_debug + 1, sizeof(g_debug[0]) * (MAX_DEBUG - 1));
-        g_debugCount = MAX_DEBUG - 1;
-    }
-    lstrcpynA(g_debug[g_debugCount++], buf, 255);
-    LeaveCriticalSection(&g_lock);
+static void dbg(const char *fmt,...){
+    char t[512]; va_list ap; va_start(ap,fmt); vsnprintf(t,sizeof(t),fmt,ap); va_end(ap);
+    lock(); addbuf(g_debug,&g_dbg_pos,sizeof(g_debug),"[DBG] %s\n",t); lstrcpynA(g_last,t,sizeof(g_last)); unlock();
 }
 
-static void add_row(const char *a, const char *b, const char *note) {
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    EnterCriticalSection(&g_lock);
-    if (g_rowCount >= MAX_ROWS) {
-        memmove(g_rows, g_rows + 1, sizeof(g_rows[0]) * (MAX_ROWS - 1));
-        g_rowCount = MAX_ROWS - 1;
-    }
-    snprintf(g_rows[g_rowCount].time, sizeof(g_rows[g_rowCount].time),
-             "%02d:%02d:%02d.%03d", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    lstrcpynA(g_rows[g_rowCount].a, a, 31);
-    lstrcpynA(g_rows[g_rowCount].b, b, 31);
-    lstrcpynA(g_rows[g_rowCount].note, note, 127);
-    g_rowCount++;
-    LeaveCriticalSection(&g_lock);
+static void op(const char *fmt,...){
+    char t[512]; va_list ap; va_start(ap,fmt); vsnprintf(t,sizeof(t),fmt,ap); va_end(ap);
+    lock(); addbuf(g_oper,&g_op_pos,sizeof(g_oper),"%s\n",t); lstrcpynA(g_last,t,sizeof(g_last)); unlock();
 }
 
-static int tcp_ping(const char *host, int port, char *out, int outsz) {
-    struct addrinfo hints, *res = NULL;
-    SOCKET s = INVALID_SOCKET;
-    char portbuf[16];
-    LARGE_INTEGER freq, t1, t2;
-
-    ZeroMemory(&hints, sizeof(hints));
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_family = AF_UNSPEC;
-
-    snprintf(portbuf, sizeof(portbuf), "%d", port);
-    if (getaddrinfo(host, portbuf, &hints, &res) != 0) {
-        lstrcpynA(out, "DNS", outsz - 1);
-        return -1;
-    }
-
-    s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s == INVALID_SOCKET) {
-        freeaddrinfo(res);
-        lstrcpynA(out, "SOCK", outsz - 1);
-        return -1;
-    }
-
-    DWORD timeout = 1500;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout, sizeof(timeout));
-
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&t1);
-
-    int rc = connect(s, res->ai_addr, (int)res->ai_addrlen);
-
-    QueryPerformanceCounter(&t2);
-    closesocket(s);
-    freeaddrinfo(res);
-
-    if (rc == 0) {
-        double ms = (double)(t2.QuadPart - t1.QuadPart) * 1000.0 / (double)freq.QuadPart;
-        snprintf(out, outsz, "%.1fms", ms);
-        return (int)(ms + 0.5);
-    } else {
-        lstrcpynA(out, "FAIL", outsz - 1);
-        return -1;
-    }
+static int port_ok(unsigned short p){
+    SOCKET s=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); if(s==INVALID_SOCKET) return 0;
+    int o=1; setsockopt(s,SOL_SOCKET,SO_REUSEADDR,(const char*)&o,sizeof(o));
+    struct sockaddr_in a; ZeroMemory(&a,sizeof(a)); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK); a.sin_port=htons(p);
+    int ok=bind(s,(struct sockaddr*)&a,sizeof(a))==0; closesocket(s); return ok;
 }
 
-static int port_available(int port) {
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return 0;
-
-    struct sockaddr_in addr;
-    ZeroMemory(&addr, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    addr.sin_port = htons((u_short)port);
-
-    int ok = bind(s, (struct sockaddr *)&addr, sizeof(addr)) == 0;
-    closesocket(s);
-    return ok;
+static unsigned short pick_port(void){
+    for(unsigned short p=38000;p<38100;p++) if(port_ok(p)) return p; return 0;
 }
 
-static unsigned __stdcall worker_thread(void *arg) {
-    (void)arg;
-    add_debugf("worker start");
-    add_logf("started");
+static int send_resp(SOCKET c,const char *type,const char *body){
+    char h[256]; int bl=(int)strlen(body);
+    int hl=wsprintfA(h,"HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %d\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",type,bl);
+    if(send(c,h,hl,0)==SOCKET_ERROR) return 0;
+    if(send(c,body,bl,0)==SOCKET_ERROR) return 0;
+    return 1;
+}
 
-    time_t start = time(NULL);
-    while (WaitForSingleObject(g_stopEvent, 0) == WAIT_TIMEOUT) {
-        if (g_duration > 0 && (int)(time(NULL) - start) >= g_duration) {
-            add_debugf("duration reached");
-            break;
-        }
+static void esc(char *o,size_t n,const char *s){
+    size_t p=0; for(;*s&&p+2<n;s++){
+        if(*s=='"'||*s=='\\'){o[p++]='\\'; o[p++]=*s;}
+        else if(*s=='\n'){o[p++]='\\'; o[p++]='n';}
+        else if(*s!='\r') o[p++]=*s;
+    } o[p]=0;
+}
 
-        char a[32], b[32];
-        int ra = tcp_ping(g_aHost, g_aPort, a, sizeof(a));
-        int rb = tcp_ping(g_bHost, g_bPort, b, sizeof(b));
+static void status_json(char *out,int outsz){
+    char dbg2[32768],op2[16384],last2[256];
+    lock(); esc(dbg2,sizeof(dbg2),g_debug); esc(op2,sizeof(op2),g_oper); esc(last2,sizeof(last2),g_last);
+    int p=0;
+    p+=wsprintfA(out+p,"{\"running\":%s,\"a_stats\":\"Target=%s Port=%d\",\"b_stats\":\"Target=%s Port=%d\",\"last_log\":\"%s\",\"debug\":\"%s\",\"op_logs\":\"%s\",\"rows\":[",
+        g_run?"true":"false",g_a,g_pa,g_b,g_pb,last2,dbg2,op2);
+    for(int i=0;i<g_row_n;i++){
+        Row *r=&g_rows[i];
+        p+=wsprintfA(out+p,"%s{\"t\":\"%s\",\"a\":\"%s\",\"b\":\"%s\",\"ams\":%d,\"bms\":%d,\"note\":\"%s\"}",
+            i?",":"",r->t,r->a,r->b,r->ams,r->bms,r->note);
+    }
+    p+=wsprintfA(out+p,"]}");
+    unlock();
+}
 
-        char note[128] = {0};
-        if (ra >= 0 && rb >= 0) {
-            if (ra < rb) strcpy(note, "A faster");
-            else if (rb < ra) strcpy(note, "B faster");
-            else strcpy(note, "same");
-        } else if (ra >= 0) {
-            strcpy(note, "B fail");
-        } else if (rb >= 0) {
-            strcpy(note, "A fail");
-        } else {
-            strcpy(note, "both fail");
-        }
+static int qv(const char *q,const char *k,char *o,int n){
+    const char *p=strstr(q,k); if(!p) return 0; p+=strlen(k); if(*p!='=') return 0; p++;
+    int i=0; while(*p&&*p!='&'&&i<n-1){ o[i++]=(*p=='+')?' ':*p; p++; } o[i]=0; return 1;
+}
 
-        add_row(a, b, note);
-        add_debugf("tick a=%s b=%s", a, b);
+static int tcp_ms(const char *host,int port,int timeout_ms){
+    SOCKET s=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); if(s==INVALID_SOCKET) return -1;
+    u_long nb=1; ioctlsocket(s,FIONBIO,&nb);
+    struct sockaddr_in a; ZeroMemory(&a,sizeof(a)); a.sin_family=AF_INET; a.sin_port=htons((u_short)port);
+    a.sin_addr.s_addr=inet_addr(host);
+    if(a.sin_addr.s_addr==INADDR_NONE){
+        struct hostent *he=gethostbyname(host); if(!he){ closesocket(s); return -1; }
+        memcpy(&a.sin_addr,he->h_addr,he->h_length);
+    }
+    DWORD t0=GetTickCount();
+    if(connect(s,(struct sockaddr*)&a,sizeof(a))==0){ closesocket(s); return (int)(GetTickCount()-t0); }
+    fd_set wf; FD_ZERO(&wf); FD_SET(s,&wf);
+    struct timeval tv; tv.tv_sec=timeout_ms/1000; tv.tv_usec=(timeout_ms%1000)*1000;
+    if(select(0,NULL,&wf,NULL,&tv)>0){
+        int e=0,l=sizeof(e); getsockopt(s,SOL_SOCKET,SO_ERROR,(char*)&e,&l);
+        if(e==0){ closesocket(s); return (int)(GetTickCount()-t0); }
+    }
+    closesocket(s); return -1;
+}
+
+static unsigned __stdcall ping_th(void *p){
+    (void)p; dbg("ping worker started");
+    DWORD st=GetTickCount();
+    while(g_ping){
+        SYSTEMTIME tm; GetLocalTime(&tm);
+        Row r; ZeroMemory(&r,sizeof(r));
+        wsprintfA(r.t,"%02d:%02d:%02d",tm.wHour,tm.wMinute,tm.wSecond);
+        r.ams=tcp_ms(g_a,g_pa,1000); r.bms=tcp_ms(g_b,g_pb,1000);
+        wsprintfA(r.a,"%s",r.ams>=0?"":"timeout"); if(r.ams>=0) wsprintfA(r.a,"%d ms",r.ams);
+        wsprintfA(r.b,"%s",r.bms>=0?"":"timeout"); if(r.bms>=0) wsprintfA(r.b,"%d ms",r.bms);
+        lstrcpyA(r.note,"tick");
+        lock();
+        if(g_row_n<256) g_rows[g_row_n++]=r; else { memmove(g_rows,g_rows+1,sizeof(Row)*255); g_rows[255]=r; }
+        unlock();
+        op("A=%s B=%s",r.a,r.b);
+        if(g_dur>0 && (int)((GetTickCount()-st)/1000)>=g_dur) break;
         Sleep(1000);
     }
-
-    InterlockedExchange(&g_running, 0);
-    add_logf("stopped");
-    add_debugf("worker exit");
-    return 0;
+    g_ping=0; dbg("ping worker stopped"); return 0;
 }
 
-static void start_worker(void) {
-    if (InterlockedCompareExchange(&g_running, 1, 0) != 0) return;
-
-    ResetEvent(g_stopEvent);
-    g_worker = (HANDLE)_beginthreadex(NULL, 0, worker_thread, NULL, 0, NULL);
-    add_debugf("start worker");
+static void start_ping(void){
+    if(g_ping) return;
+    g_ping=1; g_ping_th=(HANDLE)_beginthreadex(NULL,0,ping_th,NULL,0,NULL);
 }
 
-static void stop_worker(void) {
-    if (InterlockedCompareExchange(&g_running, 0, 1) == 1) {
-        SetEvent(g_stopEvent);
-        if (g_worker) {
-            WaitForSingleObject(g_worker, INFINITE);
-            CloseHandle(g_worker);
-            g_worker = NULL;
-        }
-        add_debugf("stop worker");
+static void stop_ping(void){
+    g_ping=0;
+    if(g_ping_th){ WaitForSingleObject(g_ping_th,1500); CloseHandle(g_ping_th); g_ping_th=NULL; }
+}
+
+static unsigned __stdcall server_th(void *p){
+    (void)p;
+    SOCKET s=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP); if(s==INVALID_SOCKET){ dbg("socket failed"); return 0; }
+    int o=1; setsockopt(s,SOL_SOCKET,SO_REUSEADDR,(const char*)&o,sizeof(o));
+    struct sockaddr_in a; ZeroMemory(&a,sizeof(a)); a.sin_family=AF_INET; a.sin_addr.s_addr=inet_addr("127.0.0.1"); a.sin_port=htons(g_port);
+    if(bind(s,(struct sockaddr*)&a,sizeof(a))!=0){ dbg("bind failed on %u",g_port); closesocket(s); return 0; }
+    if(listen(s,8)!=0){ dbg("listen failed"); closesocket(s); return 0; }
+    g_ready=1; dbg("server started on 127.0.0.1:%u",g_port);
+    while(g_run){
+        fd_set rf; FD_ZERO(&rf); FD_SET(s,&rf);
+        struct timeval tv={0,200000};
+        if(select(0,&rf,NULL,NULL,&tv)<=0) continue;
+        SOCKET c=accept(s,NULL,NULL); if(c==INVALID_SOCKET) continue;
+        char req[4096]; int n=recv(c,req,sizeof(req)-1,0); if(n<=0){ closesocket(c); continue; }
+        req[n]=0;
+        char m[16], path[1024]; ZeroMemory(m,sizeof(m)); ZeroMemory(path,sizeof(path));
+        sscanf(req,"%15s %1023s",m,path);
+        dbg("received %s",path);
+        if(!strcmp(path,"/")) send_resp(c,"text/html; charset=utf-8",HTML);
+        else if(!strcmp(path,"/main.js")) send_resp(c,"application/javascript; charset=utf-8",JS);
+        else if(!strncmp(path,"/api/start",10)){
+            char t[256],v[32];
+            if(qv(path,"a",t,sizeof(t))) lstrcpynA(g_a,t,sizeof(g_a));
+            if(qv(path,"b",t,sizeof(t))) lstrcpynA(g_b,t,sizeof(g_b));
+            if(qv(path,"pa",v,sizeof(v))) g_pa=atoi(v);
+            if(qv(path,"pb",v,sizeof(v))) g_pb=atoi(v);
+            if(qv(path,"d",v,sizeof(v))) g_dur=atoi(v);
+            start_ping(); send_resp(c,"application/json","{\"ok\":true}");
+        } else if(!strncmp(path,"/api/stop",9)){
+            stop_ping(); send_resp(c,"application/json","{\"ok\":true}");
+        } else if(!strncmp(path,"/api/status",11)){
+            char j[49152]; status_json(j,sizeof(j)); send_resp(c,"application/json",j);
+        } else send_resp(c,"text/plain; charset=utf-8","404");
+        closesocket(c);
     }
+    closesocket(s); dbg("server stopped"); return 0;
 }
 
-static void open_browser(void) {
-    ShellExecuteA(NULL, "open", "http://127.0.0.1:38000/", NULL, NULL, SW_SHOWNORMAL);
+static void open_web(void){
+    char u[64]; wsprintfA(u,"http://127.0.0.1:%u/",g_port); ShellExecuteA(NULL,"open",u,NULL,NULL,SW_SHOWNORMAL);
 }
 
-static void tray_add(HWND hwnd) {
-    ZeroMemory(&g_nid, sizeof(g_nid));
-    g_nid.cbSize = sizeof(g_nid);
-    g_nid.hWnd = hwnd;
-    g_nid.uID = 1;
-    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
-    lstrcpynA(g_nid.szTip, "TCPing GUI", sizeof(g_nid.szTip));
-    Shell_NotifyIconA(NIM_ADD, &g_nid);
+static void tray_add(HWND h){
+    NOTIFYICONDATAA n; ZeroMemory(&n,sizeof(n)); n.cbSize=sizeof(n); n.hWnd=h; n.uID=1;
+    n.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP; n.uCallbackMessage=WM_TRAYICON; n.hIcon=LoadIcon(NULL,IDI_APPLICATION);
+    lstrcpyA(n.szTip,"TCPing GUI"); Shell_NotifyIconA(NIM_ADD,&n);
 }
 
-static void tray_del(void) {
-    Shell_NotifyIconA(NIM_DELETE, &g_nid);
+static void tray_del(HWND h){
+    NOTIFYICONDATAA n; ZeroMemory(&n,sizeof(n)); n.cbSize=sizeof(n); n.hWnd=h; n.uID=1; Shell_NotifyIconA(NIM_DELETE,&n);
 }
 
-static void show_menu(HWND hwnd) {
-    POINT pt;
-    GetCursorPos(&pt);
-    SetForegroundWindow(hwnd);
-    TrackPopupMenu(g_menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+static void tray_menu(HWND h){
+    POINT p; GetCursorPos(&p);
+    HMENU m=CreatePopupMenu();
+    AppendMenuA(m,MF_STRING,ID_SHOW,"Show Window");
+    AppendMenuA(m,MF_STRING,ID_START,"Start");
+    AppendMenuA(m,MF_STRING,ID_STOP,"Stop");
+    AppendMenuA(m,MF_SEPARATOR,0,NULL);
+    AppendMenuA(m,MF_STRING,ID_EXIT,"Exit");
+    SetForegroundWindow(h);
+    TrackPopupMenu(m,TPM_RIGHTBUTTON,p.x,p.y,0,h,NULL);
+    DestroyMenu(m);
 }
 
-static void send_text(SOCKET s, const char *buf) {
-    send(s, buf, (int)strlen(buf), 0);
+static void start_server(void){
+    if(!port_ok(g_port)){ g_port=pick_port(); if(!g_port){ MessageBoxA(NULL,"No available port.","TCPing",MB_OK|MB_ICONERROR); return; } }
+    g_run=1; g_srv_th=(HANDLE)_beginthreadex(NULL,0,server_th,NULL,0,NULL);
+    for(int i=0;i<50&&!g_ready;i++) Sleep(100);
+    if(!g_ready){ MessageBoxA(NULL,"Server start failed.","TCPing",MB_OK|MB_ICONERROR); g_run=0; return; }
+    open_web();
 }
 
-static void json_escape_append(char *dst, size_t *pos, size_t cap, const char *src) {
-    while (*src && *pos + 2 < cap) {
-        unsigned char c = (unsigned char)*src++;
-        if (c == '\\' || c == '"') {
-            dst[(*pos)++] = '\\';
-            dst[(*pos)++] = c;
-        } else if (c == '\n') {
-            dst[(*pos)++] = '\\';
-            dst[(*pos)++] = 'n';
-        } else if (c == '\r') {
-        } else {
-            dst[(*pos)++] = c;
-        }
-    }
+static void stop_server(void){
+    g_run=0; stop_ping();
+    if(g_srv_th){ WaitForSingleObject(g_srv_th,1500); CloseHandle(g_srv_th); g_srv_th=NULL; }
+    g_ready=0;
 }
 
-static void respond_text(SOCKET s, const char *ctype, const char *body) {
-    char hdr[256];
-    snprintf(hdr, sizeof(hdr),
-             "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
-             ctype, strlen(body));
-    send_text(s, hdr);
-    send_text(s, body);
-}
-
-static void respond_json(SOCKET s, const char *body) {
-    respond_text(s, "application/json; charset=utf-8", body);
-}
-
-static int socket_recv_all(SOCKET s, char *buf, int cap) {
-    int used = 0;
-    int n;
-    while (used < cap - 1) {
-        n = recv(s, buf + used, cap - 1 - used, 0);
-        if (n <= 0) break;
-        used += n;
-        buf[used] = 0;
-        if (strstr(buf, "\r\n\r\n")) break;
-    }
-    return used;
-}
-
-static void handle_client(SOCKET c) {
-    char req[BUF_SIZE];
-    socket_recv_all(c, req, sizeof(req));
-    add_debugf("request in");
-
-    if (strncmp(req, "GET / HTTP/1.1", 14) == 0) {
-        respond_text(c, "text/html; charset=utf-8", g_indexHtml);
-        return;
-    }
-
-    if (strncmp(req, "GET /main.js HTTP/1.1", 21) == 0) {
-        HANDLE f = CreateFileA("main.js", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (f == INVALID_HANDLE_VALUE) {
-            respond_text(c, "application/javascript; charset=utf-8", "document.body.innerHTML='missing main.js';");
-            return;
-        }
-        DWORD size = GetFileSize(f, NULL);
-        char *js = (char *)GlobalAlloc(GMEM_FIXED, size + 1);
-        DWORD n = 0;
-        ReadFile(f, js, size, &n, NULL);
-        js[n] = 0;
-        CloseHandle(f);
-        respond_text(c, "application/javascript; charset=utf-8", js);
-        GlobalFree(js);
-        return;
-    }
-
-    if (strncmp(req, "GET /api/status HTTP/1.1", 24) == 0) {
-        char body[65536];
-        size_t p = 0;
-
-        EnterCriticalSection(&g_lock);
-
-        p += snprintf(body + p, sizeof(body) - p, "{");
-        p += snprintf(body + p, sizeof(body) - p, "\"running\":%s,", g_running ? "true" : "false");
-        p += snprintf(body + p, sizeof(body) - p, "\"a_host\":\"%s\",\"a_port\":%d,", g_aHost, g_aPort);
-        p += snprintf(body + p, sizeof(body) - p, "\"b_host\":\"%s\",\"b_port\":%d,", g_bHost, g_bPort);
-        p += snprintf(body + p, sizeof(body) - p, "\"duration\":%d,", g_duration);
-
-        p += snprintf(body + p, sizeof(body) - p, "\"rows\":[");
-        for (int i = 0; i < g_rowCount; i++) {
-            if (i) p += snprintf(body + p, sizeof(body) - p, ",");
-            p += snprintf(body + p, sizeof(body) - p,
-                          "{\"time\":\"%s\",\"a\":\"%s\",\"b\":\"%s\",\"note\":\"%s\"}",
-                          g_rows[i].time, g_rows[i].a, g_rows[i].b, g_rows[i].note);
-        }
-        p += snprintf(body + p, sizeof(body) - p, "],");
-
-        p += snprintf(body + p, sizeof(body) - p, "\"logs\":[");
-        for (int i = 0; i < g_logCount; i++) {
-            if (i) p += snprintf(body + p, sizeof(body) - p, ",");
-            p += snprintf(body + p, sizeof(body) - p, "\"");
-            json_escape_append(body, &p, sizeof(body), g_logs[i]);
-            p += snprintf(body + p, sizeof(body) - p, "\"");
-        }
-        p += snprintf(body + p, sizeof(body) - p, "],");
-
-        p += snprintf(body + p, sizeof(body) - p, "\"debug\":[");
-        for (int i = 0; i < g_debugCount; i++) {
-            if (i) p += snprintf(body + p, sizeof(body) - p, ",");
-            p += snprintf(body + p, sizeof(body) - p, "\"");
-            json_escape_append(body, &p, sizeof(body), g_debug[i]);
-            p += snprintf(body + p, sizeof(body) - p, "\"");
-        }
-        p += snprintf(body + p, sizeof(body) - p, "],");
-
-        p += snprintf(body + p, sizeof(body) - p, "\"a_stats\":\"running=%s\",\"b_stats\":\"running=%s\"",
-                      g_running ? "yes" : "no", g_running ? "yes" : "no");
-        p += snprintf(body + p, sizeof(body) - p, "}");
-
-        LeaveCriticalSection(&g_lock);
-
-        respond_json(c, body);
-        return;
-    }
-
-    if (strncmp(req, "POST /api/start HTTP/1.1", 24) == 0) {
-        char *body = strstr(req, "\r\n\r\n");
-        if (body) body += 4; else body = "";
-        char a[128] = {0}, b[128] = {0};
-        int ap = 80, bp = 80, dur = 60;
-
-        sscanf(body,
-               "{\"a_host\":\"%127[^\"]\",\"a_port\":\"%d\",\"b_host\":\"%127[^\"]\",\"b_port\":\"%d\",\"duration\":\"%d\"}",
-               a, &ap, b, &bp, &dur);
-
-        if (a[0]) lstrcpynA(g_aHost, a, sizeof(g_aHost));
-        if (b[0]) lstrcpynA(g_bHost, b, sizeof(g_bHost));
-        g_aPort = ap > 0 ? ap : 80;
-        g_bPort = bp > 0 ? bp : 80;
-        g_duration = dur > 0 ? dur : 60;
-
-        add_debugf("api start %s:%d %s:%d dur=%d", g_aHost, g_aPort, g_bHost, g_bPort, g_duration);
-        start_worker();
-        respond_json(c, "{\"ok\":true}");
-        return;
-    }
-
-    if (strncmp(req, "POST /api/stop HTTP/1.1", 23) == 0) {
-        add_debugf("api stop");
-        stop_worker();
-        respond_json(c, "{\"ok\":true}");
-        return;
-    }
-
-    respond_text(c, "text/plain; charset=utf-8", "not found");
-}
-
-static unsigned __stdcall client_thread(void *arg) {
-    SOCKET c = (SOCKET)(uintptr_t)arg;
-    handle_client(c);
-    closesocket(c);
-    return 0;
-}
-
-static unsigned __stdcall server_thread(void *arg) {
-    (void)arg;
-    WSADATA wsa;
-    SOCKET s = INVALID_SOCKET;
-    struct sockaddr_in addr;
-    int reuse = 1;
-
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-    add_debugf("wsastartup");
-
-    if (!port_available(PORT)) {
-        add_logf("port 38000 busy");
-        add_debugf("port check failed");
-        return 0;
-    }
-
-    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) {
-        add_logf("socket fail");
-        return 0;
-    }
-
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
-
-    ZeroMemory(&addr, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    addr.sin_port = htons(PORT);
-
-    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        add_logf("bind fail");
-        closesocket(s);
-        return 0;
-    }
-
-    if (listen(s, 16) != 0) {
-        add_logf("listen fail");
-        closesocket(s);
-        return 0;
-    }
-
-    add_debugf("listen 127.0.0.1:%d", PORT);
-    add_logf("server ready");
-
-    open_browser();
-
-    while (1) {
-        SOCKET c = accept(s, NULL, NULL);
-        if (c == INVALID_SOCKET) continue;
-        _beginthreadex(NULL, 0, client_thread, (void *)(uintptr_t)c, 0, NULL);
-    }
-
-    closesocket(s);
-    return 0;
-}
-
-static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_CREATE:
-        tray_add(hwnd);
-        break;
+static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM w,LPARAM l){
+    switch(m){
+    case WM_CREATE: tray_add(h); start_server(); return 0;
     case WM_TRAYICON:
-        if (lParam == WM_RBUTTONUP) show_menu(hwnd);
-        if (lParam == WM_LBUTTONDBLCLK) ShowWindow(hwnd, SW_SHOW);
-        break;
-    case WM_COMMAND:
-        switch (LOWORD(wParam)) {
-        case 1: ShowWindow(hwnd, SW_SHOW); break;
-        case 2: start_worker(); break;
-        case 3: stop_worker(); break;
-        case 4:
-            stop_worker();
-            tray_del();
-            DestroyWindow(hwnd);
-            break;
-        }
-        break;
-    case WM_CLOSE:
-        ShowWindow(hwnd, SW_HIDE);
+        if(l==WM_RBUTTONUP) tray_menu(h);
+        else if(l==WM_LBUTTONDBLCLK) ShowWindow(h,SW_SHOW);
         return 0;
-    case WM_DESTROY:
-        stop_worker();
-        tray_del();
-        PostQuitMessage(0);
-        break;
-    default:
-        return DefWindowProc(hwnd, msg, wParam, lParam);
+    case WM_COMMAND:
+        switch(LOWORD(w)){
+        case ID_SHOW: ShowWindow(h,SW_SHOW); SetForegroundWindow(h); break;
+        case ID_START: start_ping(); break;
+        case ID_STOP: stop_ping(); break;
+        case ID_EXIT: DestroyWindow(h); break;
+        } return 0;
+    case WM_CLOSE: ShowWindow(h,SW_HIDE); return 0;
+    case WM_DESTROY: tray_del(h); stop_server(); PostQuitMessage(0); return 0;
     }
-    return 0;
+    return DefWindowProc(h,m,w,l);
 }
 
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR lpCmd, int nCmdShow) {
-    (void)hPrev; (void)lpCmd; (void)nCmdShow;
+int WINAPI WinMain(HINSTANCE hi,HINSTANCE hp,LPSTR lp,int ns){
+    (void)hp; (void)lp; (void)ns;
+    WSADATA w; if(WSAStartup(MAKEWORD(2,2),&w)) return 1;
+    g_mtx=CreateMutexA(NULL,FALSE,NULL);
 
-    InitializeCriticalSection(&g_lock);
-    g_stopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-
-    WNDCLASSA wc = {0};
-    wc.lpfnWndProc = wndproc;
-    wc.hInstance = hInst;
-    wc.lpszClassName = "TCPingGUIWnd";
+    WNDCLASSA wc; ZeroMemory(&wc,sizeof(wc));
+    wc.lpfnWndProc=WndProc; wc.hInstance=hi; wc.lpszClassName="TCPingGUI";
+    wc.hIcon=LoadIcon(NULL,IDI_APPLICATION);
     RegisterClassA(&wc);
 
-    g_hwnd = CreateWindowA("TCPingGUIWnd", "TCPing GUI", WS_OVERLAPPEDWINDOW,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 640, 480,
-                           NULL, NULL, hInst, NULL);
-
-    g_menu = CreatePopupMenu();
-    AppendMenuA(g_menu, MF_STRING, 1, "Show Window");
-    AppendMenuA(g_menu, MF_STRING, 2, "Start");
-    AppendMenuA(g_menu, MF_STRING, 3, "Stop");
-    AppendMenuA(g_menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuA(g_menu, MF_STRING, 4, "Exit");
-
-    _beginthreadex(NULL, 0, server_thread, NULL, 0, NULL);
-
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-
-    DeleteCriticalSection(&g_lock);
+    g_hwnd=CreateWindowExA(0,"TCPingGUI","TCPing GUI",WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,CW_USEDEFAULT,800,600,NULL,NULL,hi,NULL);
+    if(!g_hwnd) return 1;
+    ShowWindow(g_hwnd,SW_HIDE);
+    MSG msg; while(GetMessage(&msg,NULL,0,0)){ TranslateMessage(&msg); DispatchMessage(&msg); }
+    if(g_mtx) CloseHandle(g_mtx);
+    WSACleanup();
     return 0;
 }
