@@ -34,7 +34,8 @@ jobs:
       - name: Build exe
         shell: msys2 {0}
         run: |
-          gcc -O2 -Wall -municode -mwindows main.c -o TCPing_GUI.exe -lws2_32 -lshell32
+          gcc -O2 -Wall -municode -mwindows main.c -o TCPing_GUI.exe -lws2_32 -lshell32 -lcomctl32
+
 
       - name: Prepare package
         shell: powershell
