@@ -1,18 +1,15 @@
 #define _WIN32_WINNT 0x0601
-#include <windows.h>
 #include <winsock2.h>
+#include <windows.h>
 #include <ws2tcpip.h>
 #include <shellapi.h>
+#include <process.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
-#include <process.h>
 #include <time.h>
 
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "shell32.lib")
-
-#define PORT 8080
+#define PORT 38000
 #define MAX_ROWS 256
 #define MAX_LOGS 256
 #define MAX_DEBUG 256
@@ -147,6 +144,21 @@ static int tcp_ping(const char *host, int port, char *out, int outsz) {
     }
 }
 
+static int port_available(int port) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return 0;
+
+    struct sockaddr_in addr;
+    ZeroMemory(&addr, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr.sin_port = htons((u_short)port);
+
+    int ok = bind(s, (struct sockaddr *)&addr, sizeof(addr)) == 0;
+    closesocket(s);
+    return ok;
+}
+
 static unsigned __stdcall worker_thread(void *arg) {
     (void)arg;
     add_debugf("worker start");
@@ -208,7 +220,7 @@ static void stop_worker(void) {
 }
 
 static void open_browser(void) {
-    ShellExecuteA(NULL, "open", "http://127.0.0.1:8080/", NULL, NULL, SW_SHOWNORMAL);
+    ShellExecuteA(NULL, "open", "http://127.0.0.1:38000/", NULL, NULL, SW_SHOWNORMAL);
 }
 
 static void tray_add(HWND hwnd) {
@@ -234,69 +246,66 @@ static void show_menu(HWND hwnd) {
     TrackPopupMenu(g_menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
 }
 
-static void send_text(HANDLE h, const char *s) {
-    DWORD n;
-    WriteFile(h, s, (DWORD)strlen(s), &n, NULL);
+static void send_text(SOCKET s, const char *buf) {
+    send(s, buf, (int)strlen(buf), 0);
 }
 
 static void json_escape_append(char *dst, size_t *pos, size_t cap, const char *src) {
-    for (; *src && *pos + 2 < cap; src++) {
-        unsigned char c = (unsigned char)*src;
+    while (*src && *pos + 2 < cap) {
+        unsigned char c = (unsigned char)*src++;
         if (c == '\\' || c == '"') {
-            if (*pos + 2 >= cap) break;
             dst[(*pos)++] = '\\';
             dst[(*pos)++] = c;
         } else if (c == '\n') {
-            if (*pos + 2 >= cap) break;
             dst[(*pos)++] = '\\';
             dst[(*pos)++] = 'n';
         } else if (c == '\r') {
-            continue;
         } else {
             dst[(*pos)++] = c;
         }
     }
 }
 
-static void respond_json(HANDLE h, const char *body) {
-    char hdr[256];
-    snprintf(hdr, sizeof(hdr),
-             "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
-             strlen(body));
-    send_text(h, hdr);
-    send_text(h, body);
-}
-
-static void respond_text(HANDLE h, const char *ctype, const char *body) {
+static void respond_text(SOCKET s, const char *ctype, const char *body) {
     char hdr[256];
     snprintf(hdr, sizeof(hdr),
              "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
              ctype, strlen(body));
-    send_text(h, hdr);
-    send_text(h, body);
+    send_text(s, hdr);
+    send_text(s, body);
 }
 
-static char *read_request(HANDLE h, char *buf, DWORD cap) {
-    DWORD n = 0;
-    ReadFile(h, buf, cap - 1, &n, NULL);
-    buf[n] = 0;
-    return buf;
+static void respond_json(SOCKET s, const char *body) {
+    respond_text(s, "application/json; charset=utf-8", body);
 }
 
-static void handle_client(HANDLE h) {
+static int socket_recv_all(SOCKET s, char *buf, int cap) {
+    int used = 0;
+    int n;
+    while (used < cap - 1) {
+        n = recv(s, buf + used, cap - 1 - used, 0);
+        if (n <= 0) break;
+        used += n;
+        buf[used] = 0;
+        if (strstr(buf, "\r\n\r\n")) break;
+    }
+    return used;
+}
+
+static void handle_client(SOCKET c) {
     char req[BUF_SIZE];
-    read_request(h, req, sizeof(req));
+    socket_recv_all(c, req, sizeof(req));
     add_debugf("request in");
 
     if (strncmp(req, "GET / HTTP/1.1", 14) == 0) {
-        respond_text(h, "text/html; charset=utf-8", g_indexHtml);
+        respond_text(c, "text/html; charset=utf-8", g_indexHtml);
         return;
     }
 
     if (strncmp(req, "GET /main.js HTTP/1.1", 21) == 0) {
         HANDLE f = CreateFileA("main.js", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (f == INVALID_HANDLE_VALUE) {
-            respond_text(h, "application/javascript; charset=utf-8", "document.body.innerHTML='missing main.js';");
+            respond_text(c, "application/javascript; charset=utf-8", "document.body.innerHTML='missing main.js';");
             return;
         }
         DWORD size = GetFileSize(f, NULL);
@@ -305,7 +314,7 @@ static void handle_client(HANDLE h) {
         ReadFile(f, js, size, &n, NULL);
         js[n] = 0;
         CloseHandle(f);
-        respond_text(h, "application/javascript; charset=utf-8", js);
+        respond_text(c, "application/javascript; charset=utf-8", js);
         GlobalFree(js);
         return;
     }
@@ -313,7 +322,9 @@ static void handle_client(HANDLE h) {
     if (strncmp(req, "GET /api/status HTTP/1.1", 24) == 0) {
         char body[65536];
         size_t p = 0;
+
         EnterCriticalSection(&g_lock);
+
         p += snprintf(body + p, sizeof(body) - p, "{");
         p += snprintf(body + p, sizeof(body) - p, "\"running\":%s,", g_running ? "true" : "false");
         p += snprintf(body + p, sizeof(body) - p, "\"a_host\":\"%s\",\"a_port\":%d,", g_aHost, g_aPort);
@@ -323,7 +334,8 @@ static void handle_client(HANDLE h) {
         p += snprintf(body + p, sizeof(body) - p, "\"rows\":[");
         for (int i = 0; i < g_rowCount; i++) {
             if (i) p += snprintf(body + p, sizeof(body) - p, ",");
-            p += snprintf(body + p, sizeof(body) - p, "{\"time\":\"%s\",\"a\":\"%s\",\"b\":\"%s\",\"note\":\"%s\"}",
+            p += snprintf(body + p, sizeof(body) - p,
+                          "{\"time\":\"%s\",\"a\":\"%s\",\"b\":\"%s\",\"note\":\"%s\"}",
                           g_rows[i].time, g_rows[i].a, g_rows[i].b, g_rows[i].note);
         }
         p += snprintf(body + p, sizeof(body) - p, "],");
@@ -349,19 +361,23 @@ static void handle_client(HANDLE h) {
         p += snprintf(body + p, sizeof(body) - p, "\"a_stats\":\"running=%s\",\"b_stats\":\"running=%s\"",
                       g_running ? "yes" : "no", g_running ? "yes" : "no");
         p += snprintf(body + p, sizeof(body) - p, "}");
+
         LeaveCriticalSection(&g_lock);
 
-        respond_json(h, body);
+        respond_json(c, body);
         return;
     }
 
     if (strncmp(req, "POST /api/start HTTP/1.1", 24) == 0) {
         char *body = strstr(req, "\r\n\r\n");
         if (body) body += 4; else body = "";
-        char a[128], b[128];
+        char a[128] = {0}, b[128] = {0};
         int ap = 80, bp = 80, dur = 60;
 
-        sscanf(body, "{\"a_host\":\"%127[^\"]\",\"a_port\":\"%d\",\"b_host\":\"%127[^\"]\",\"b_port\":\"%d\",\"duration\":\"%d\"}", a, &ap, b, &bp, &dur);
+        sscanf(body,
+               "{\"a_host\":\"%127[^\"]\",\"a_port\":\"%d\",\"b_host\":\"%127[^\"]\",\"b_port\":\"%d\",\"duration\":\"%d\"}",
+               a, &ap, b, &bp, &dur);
+
         if (a[0]) lstrcpynA(g_aHost, a, sizeof(g_aHost));
         if (b[0]) lstrcpynA(g_bHost, b, sizeof(g_bHost));
         g_aPort = ap > 0 ? ap : 80;
@@ -370,18 +386,25 @@ static void handle_client(HANDLE h) {
 
         add_debugf("api start %s:%d %s:%d dur=%d", g_aHost, g_aPort, g_bHost, g_bPort, g_duration);
         start_worker();
-        respond_json(h, "{\"ok\":true}");
+        respond_json(c, "{\"ok\":true}");
         return;
     }
 
     if (strncmp(req, "POST /api/stop HTTP/1.1", 23) == 0) {
         add_debugf("api stop");
         stop_worker();
-        respond_json(h, "{\"ok\":true}");
+        respond_json(c, "{\"ok\":true}");
         return;
     }
 
-    respond_text(h, "text/plain; charset=utf-8", "not found");
+    respond_text(c, "text/plain; charset=utf-8", "not found");
+}
+
+static unsigned __stdcall client_thread(void *arg) {
+    SOCKET c = (SOCKET)(uintptr_t)arg;
+    handle_client(c);
+    closesocket(c);
+    return 0;
 }
 
 static unsigned __stdcall server_thread(void *arg) {
@@ -389,13 +412,23 @@ static unsigned __stdcall server_thread(void *arg) {
     WSADATA wsa;
     SOCKET s = INVALID_SOCKET;
     struct sockaddr_in addr;
-    HANDLE th;
     int reuse = 1;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
     add_debugf("wsastartup");
 
+    if (!port_available(PORT)) {
+        add_logf("port 38000 busy");
+        add_debugf("port check failed");
+        return 0;
+    }
+
     s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) {
+        add_logf("socket fail");
+        return 0;
+    }
+
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
 
     ZeroMemory(&addr, sizeof(addr));
@@ -405,9 +438,16 @@ static unsigned __stdcall server_thread(void *arg) {
 
     if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         add_logf("bind fail");
+        closesocket(s);
         return 0;
     }
-    listen(s, 16);
+
+    if (listen(s, 16) != 0) {
+        add_logf("listen fail");
+        closesocket(s);
+        return 0;
+    }
+
     add_debugf("listen 127.0.0.1:%d", PORT);
     add_logf("server ready");
 
@@ -416,15 +456,10 @@ static unsigned __stdcall server_thread(void *arg) {
     while (1) {
         SOCKET c = accept(s, NULL, NULL);
         if (c == INVALID_SOCKET) continue;
-        th = (HANDLE)_beginthreadex(NULL, 0, (unsigned(__stdcall *)(void *))[](void *p)->unsigned {
-            SOCKET cs = (SOCKET)(uintptr_t)p;
-            HANDLE hf = (HANDLE)_open_osfhandle((intptr_t)cs, 0);
-            handle_client(hf);
-            closesocket(cs);
-            return 0;
-        }, (void *)(uintptr_t)c, 0, NULL);
-        CloseHandle(th);
+        _beginthreadex(NULL, 0, client_thread, (void *)(uintptr_t)c, 0, NULL);
     }
+
+    closesocket(s);
     return 0;
 }
 
