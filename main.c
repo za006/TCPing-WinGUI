@@ -1,454 +1,847 @@
-#define UNICODE
-#define _UNICODE
 #define _WIN32_WINNT 0x0600
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <commctrl.h>
+#include <windowsx.h>
+#include <shellapi.h>
 #include <process.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
-#include <time.h>
 
-#define IDC_IPEDIT         101
-#define IDC_PORTEDIT       102
-#define IDC_COUNTEDIT      103
-#define IDC_LOGEDIT        104
-#define IDC_STARTBUTTON    105
-#define IDC_STOPBUTTON     106
-#define ID_MENU_COPY       107
-#define ID_MENU_SELECT_ALL 108
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "shell32.lib")
 
-#define MAX_LOG_CHARS      32768
+#define APP_CLASS L"TCPingGUIClass"
+#define APP_TITLE L"TCPing GUI"
+#define ID_TRAYICON 1001
+#define WM_TRAYICON (WM_APP + 1)
 
-static HWND hIpEdit, hPortEdit, hCountEdit, hLogEdit, hStartButton, hStopButton;
-static HFONT hFont = NULL;
-static HFONT hFontBold = NULL;
-static volatile LONG g_running = 0;
-static volatile LONG g_stop = 0;
-static HANDLE g_thread = NULL;
+#define MAX_LOG 32768
+#define MAX_RESULT 512
+#define SERVER_PORT_BASE 38000
+#define SERVER_PORT_MAX 38099
+
 static HWND g_hwnd = NULL;
+static HWND g_editAHost, g_editAPort, g_editBHost, g_editBPort, g_editDur;
+static HWND g_btnStart, g_btnStop, g_btnShow, g_status;
+static HWND g_list;
+static HWND g_logOp, g_logDbg;
 
-typedef struct _PingStats {
-    int pingCount, successCount, failCount;
-    double totalTime, minTime, maxTime;
-    int maxPingLimit;
-} PingStats;
+static HANDLE g_server_thread = NULL;
+static HANDLE g_ping_thread = NULL;
+static volatile LONG g_running = 0;
+static volatile LONG g_should_stop = 0;
+static SOCKET g_listen_sock = INVALID_SOCKET;
+static UINT g_server_port = 0;
 
-static void AppendLog(const wchar_t* text);
-static void StartPing(void);
-static void StopPing(void);
-static void PingThreadCleanup(PingStats* stats);
-static DWORD WINAPI PingThread(LPVOID lpParam);
-static int TCPPing(const wchar_t* host, int port, double* elapsed);
+static CRITICAL_SECTION g_log_cs;
+static CRITICAL_SECTION g_data_cs;
 
-static void SafeSetWindowText(HWND h, const wchar_t* s) {
-    SetWindowTextW(h, s ? s : L"");
+static wchar_t g_log_op[MAX_LOG];
+static wchar_t g_log_dbg[MAX_LOG];
+
+static wchar_t g_a_host[128] = L"";
+static wchar_t g_b_host[128] = L"";
+static wchar_t g_a_port[16] = L"80";
+static wchar_t g_b_port[16] = L"80";
+static int g_duration = 30;
+
+static long long g_a_ok = 0, g_a_fail = 0, g_b_ok = 0, g_b_fail = 0;
+static double g_a_last = -1.0, g_b_last = -1.0;
+static wchar_t g_last_note[256] = L"Idle";
+
+typedef struct PingTask {
+    wchar_t host[128];
+    wchar_t port[16];
+    double last_ms;
+    long long ok;
+    long long fail;
+    int family;
+} PingTask;
+
+typedef struct ResultRow {
+    wchar_t time[32];
+    wchar_t a[32];
+    wchar_t b[32];
+    wchar_t abar[64];
+    wchar_t bbar[64];
+    wchar_t note[128];
+} ResultRow;
+
+static ResultRow g_rows[64];
+static int g_row_count = 0;
+
+static void AppendText(HWND h, const wchar_t* text) {
+    int len = GetWindowTextLengthW(h);
+    SendMessageW(h, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+    SendMessageW(h, EM_REPLACESEL, 0, (LPARAM)text);
+    SendMessageW(h, EM_SCROLLCARET, 0, 0);
 }
 
-static void TrimLogIfNeeded(void) {
-    int len = GetWindowTextLengthW(hLogEdit);
-    if (len < MAX_LOG_CHARS) return;
+static void LogOp(const wchar_t* fmt, ...) {
+    wchar_t buf[1024];
+    wchar_t line[1200];
+    va_list ap;
+    va_start(ap, fmt);
+    vswprintf(buf, 1024, fmt, ap);
+    va_end(ap);
 
-    int cut = len / 2;
-    SendMessageW(hLogEdit, EM_SETSEL, 0, cut);
-    SendMessageW(hLogEdit, EM_REPLACESEL, TRUE, (LPARAM)L"");
-}
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    swprintf(line, 1200, L"[%02d:%02d:%02d] %s\r\n", st.wHour, st.wMinute, st.wSecond, buf);
 
-static void AppendLog(const wchar_t* text) {
-    if (!text) return;
-    int oldLen = GetWindowTextLengthW(hLogEdit);
-    SendMessageW(hLogEdit, EM_SETSEL, oldLen, oldLen);
-    SendMessageW(hLogEdit, EM_REPLACESEL, FALSE, (LPARAM)text);
-    SendMessageW(hLogEdit, EM_REPLACESEL, FALSE, (LPARAM)L"\r\n");
-    TrimLogIfNeeded();
-    SendMessageW(hLogEdit, EM_SCROLLCARET, 0, 0);
-}
+    EnterCriticalSection(&g_log_cs);
+    wcsncat(g_log_op, line, MAX_LOG - wcslen(g_log_op) - 1);
+    LeaveCriticalSection(&g_log_cs);
 
-static void SetControlsRunning(BOOL running) {
-    EnableWindow(hStartButton, !running);
-    EnableWindow(hStopButton, running);
-}
-
-static void StartPing(void) {
-    if (InterlockedCompareExchange(&g_running, 1, 0) != 0) return;
-
-    wchar_t host[256] = {0};
-    wchar_t portStr[32] = {0};
-    wchar_t countStr[32] = {0};
-
-    GetWindowTextW(hIpEdit, host, 255);
-    GetWindowTextW(hPortEdit, portStr, 31);
-    GetWindowTextW(hCountEdit, countStr, 31);
-
-    int port = _wtoi(portStr);
-    int maxCount = _wtoi(countStr);
-
-    if (host[0] == 0 || port <= 0 || port > 65535) {
-        MessageBoxW(g_hwnd, L"请输入有效的IP/域名和端口（1-65535）", L"错误", MB_ICONERROR);
-        InterlockedExchange(&g_running, 0);
-        return;
+    if (g_log_op) {
+        SetWindowTextW(g_log_op ? g_log_op : NULL, g_log_op);
     }
-
-    if (maxCount < 0) maxCount = 0;
-
-    SetWindowTextW(hLogEdit, L"");
-    AppendLog(L"开始 TCPing...");
-    SetControlsRunning(TRUE);
-
-    typedef struct {
-        wchar_t host[256];
-        int port;
-        PingStats* stats;
-    } PingParams;
-
-    PingStats* stats = (PingStats*)calloc(1, sizeof(PingStats));
-    PingParams* params = (PingParams*)calloc(1, sizeof(PingParams));
-    if (!stats || !params) {
-        free(stats);
-        free(params);
-        MessageBoxW(g_hwnd, L"内存分配失败", L"错误", MB_ICONERROR);
-        InterlockedExchange(&g_running, 0);
-        SetControlsRunning(FALSE);
-        return;
-    }
-
-    wcscpy_s(params->host, 256, host);
-    params->port = port;
-    params->stats = stats;
-
-    stats->minTime = 999999.0;
-    stats->maxPingLimit = maxCount;
-
-    InterlockedExchange(&g_stop, 0);
-    g_thread = CreateThread(NULL, 0, PingThread, params, 0, NULL);
-    if (!g_thread) {
-        free(stats);
-        free(params);
-        InterlockedExchange(&g_running, 0);
-        SetControlsRunning(FALSE);
-        AppendLog(L"启动线程失败。");
-        return;
-    }
-    CloseHandle(g_thread);
 }
 
-static void StopPing(void) {
-    if (InterlockedCompareExchange(&g_running, 0, 1) != 1) return;
-    InterlockedExchange(&g_stop, 1);
-    AppendLog(L"正在停止...");
-    SetControlsRunning(FALSE);
+static void LogDbg(const wchar_t* fmt, ...) {
+    wchar_t buf[1024];
+    wchar_t line[1200];
+    va_list ap;
+    va_start(ap, fmt);
+    vswprintf(buf, 1024, fmt, ap);
+    va_end(ap);
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    swprintf(line, 1200, L"[%02d:%02d:%02d] %s\r\n", st.wHour, st.wMinute, st.wSecond, buf);
+
+    EnterCriticalSection(&g_log_cs);
+    wcsncat(g_log_dbg, line, MAX_LOG - wcslen(g_log_dbg) - 1);
+    LeaveCriticalSection(&g_log_cs);
 }
 
-static void PingThreadCleanup(PingStats* finalStats) {
-    wchar_t buf[256];
+static void RefreshLogs(void) {
+    EnterCriticalSection(&g_log_cs);
+    SetWindowTextW(g_log_op, g_log_op);
+    SetWindowTextW(g_log_dbg, g_log_dbg);
+    LeaveCriticalSection(&g_log_cs);
+}
 
-    InterlockedExchange(&g_running, 0);
-    InterlockedExchange(&g_stop, 0);
-    SetControlsRunning(FALSE);
+static void SetStatusText(void) {
+    wchar_t buf[512];
+    EnterCriticalSection(&g_data_cs);
+    swprintf(buf, 512, L"%s | A ok/fail %lld/%lld last %.1f ms | B ok/fail %lld/%lld last %.1f ms | %s",
+             g_running ? L"Running" : L"Stopped",
+             g_a_ok, g_a_fail, g_a_last,
+             g_b_ok, g_b_fail, g_b_last,
+             g_last_note);
+    LeaveCriticalSection(&g_data_cs);
+    SetWindowTextW(g_status, buf);
+}
 
-    AppendLog(L"");
-    AppendLog(L"Ping 统计信息:");
-
-    if (finalStats && finalStats->pingCount > 0) {
-        swprintf(buf, 256, L"    数据包: 已发送 = %d, 已接收 = %d, 丢失 = %d (%.0f%% 丢失)",
-                 finalStats->pingCount,
-                 finalStats->successCount,
-                 finalStats->failCount,
-                 finalStats->pingCount ? (finalStats->failCount * 100.0 / finalStats->pingCount) : 0.0);
-        AppendLog(buf);
-
-        AppendLog(L"往返行程的估计时间(以毫秒为单位):");
-
-        swprintf(buf, 256, L"    最短 = %.0fms, 最长 = %.0fms, 平均 = %.0fms",
-                 finalStats->minTime == 999999.0 ? 0.0 : finalStats->minTime,
-                 finalStats->maxTime,
-                 finalStats->successCount > 0 ? (finalStats->totalTime / finalStats->successCount) : 0.0);
-        AppendLog(buf);
+static void AddResultRow(const wchar_t* a, const wchar_t* b, const wchar_t* abar, const wchar_t* bbar, const wchar_t* note) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    EnterCriticalSection(&g_data_cs);
+    if (g_row_count < 64) {
+        ResultRow* r = &g_rows[g_row_count++];
+        swprintf(r->time, 32, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+        wcsncpy(r->a, a, 31); r->a[31] = 0;
+        wcsncpy(r->b, b, 31); r->b[31] = 0;
+        wcsncpy(r->abar, abar, 63); r->abar[63] = 0;
+        wcsncpy(r->bbar, bbar, 63); r->bbar[63] = 0;
+        wcsncpy(r->note, note, 127); r->note[127] = 0;
     } else {
-        AppendLog(L"    Ping 已停止。");
+        memmove(&g_rows[0], &g_rows[1], sizeof(ResultRow) * 63);
+        ResultRow* r = &g_rows[63];
+        swprintf(r->time, 32, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+        wcsncpy(r->a, a, 31); r->a[31] = 0;
+        wcsncpy(r->b, b, 31); r->b[31] = 0;
+        wcsncpy(r->abar, abar, 63); r->abar[63] = 0;
+        wcsncpy(r->bbar, bbar, 63); r->bbar[63] = 0;
+        wcsncpy(r->note, note, 127); r->note[127] = 0;
     }
-
-    free(finalStats);
+    LeaveCriticalSection(&g_data_cs);
 }
 
-static DWORD WINAPI PingThread(LPVOID lpParam) {
-    typedef struct {
-        wchar_t host[256];
-        int port;
-        PingStats* stats;
-    } PingParams;
+static void UpdateListView(void) {
+    ListView_DeleteAllItems(g_list);
+    EnterCriticalSection(&g_data_cs);
+    for (int i = 0; i < g_row_count; i++) {
+        LVITEMW it;
+        ZeroMemory(&it, sizeof(it));
+        it.mask = LVIF_TEXT;
+        it.iItem = i;
 
-    PingParams* params = (PingParams*)lpParam;
-    wchar_t host[256];
-    wcscpy_s(host, 256, params->host);
-    int port = params->port;
-    PingStats* stats = params->stats;
-    free(params);
+        it.iSubItem = 0; it.pszText = g_rows[i].time; ListView_InsertItem(g_list, &it);
+        ListView_SetItemText(g_list, i, 1, g_rows[i].a);
+        ListView_SetItemText(g_list, i, 2, g_rows[i].b);
+        ListView_SetItemText(g_list, i, 3, g_rows[i].abar);
+        ListView_SetItemText(g_list, i, 4, g_rows[i].bbar);
+        ListView_SetItemText(g_list, i, 5, g_rows[i].note);
+    }
+    LeaveCriticalSection(&g_data_cs);
+}
 
-    wchar_t startMsg[256];
-    swprintf(startMsg, 256, L"正在 Ping %s:%d ...", host, port);
-    AppendLog(startMsg);
+static void SafeSetText(HWND h, const wchar_t* s) {
+    if (h) SetWindowTextW(h, s);
+}
 
-    while (!InterlockedCompareExchange(&g_stop, 0, 0) &&
-           (stats->maxPingLimit == 0 || stats->pingCount < stats->maxPingLimit)) {
-        double elapsed = 0.0;
-        int result = TCPPing(host, port, &elapsed);
-
-        if (InterlockedCompareExchange(&g_stop, 0, 0)) break;
-
-        stats->pingCount++;
-
-        wchar_t line[256];
-        if (result == 0) {
-            stats->successCount++;
-            stats->totalTime += elapsed;
-            if (elapsed < stats->minTime) stats->minTime = elapsed;
-            if (elapsed > stats->maxTime) stats->maxTime = elapsed;
-
-            swprintf(line, 256, L"来自 %s 的回复: 时间=%.0fms", host, elapsed);
-            AppendLog(line);
+static void JsonEscapeAppend(char* dst, size_t dstsz, const wchar_t* src) {
+    size_t len = strlen(dst);
+    for (; *src && len + 8 < dstsz; src++) {
+        char c = (char)(*src & 0x7F);
+        if (*src == L'\\' || *src == L'"') {
+            dst[len++] = '\\';
+            dst[len++] = c;
+        } else if (*src == L'\r') {
+            continue;
+        } else if (*src == L'\n') {
+            dst[len++] = '\\';
+            dst[len++] = 'n';
+        } else if ((unsigned)*src < 0x20) {
+            len += _snprintf(dst + len, dstsz - len, "\\u%04x", (unsigned)*src);
         } else {
-            stats->failCount++;
-            AppendLog(L"请求超时。");
-        }
-
-        for (int i = 0; i < 10; ++i) {
-            if (InterlockedCompareExchange(&g_stop, 0, 0)) break;
-            Sleep(100);
+            dst[len++] = c;
         }
     }
-
-    PostMessageW(g_hwnd, WM_USER + 1, 0, (LPARAM)stats);
-    return 0;
+    dst[len] = 0;
 }
 
-static int TCPPing(const wchar_t* host, int port, double* elapsed) {
-    struct addrinfoW hints, *res = NULL, *it = NULL;
-    wchar_t portStr[16];
-    SOCKET sock = INVALID_SOCKET;
-    LARGE_INTEGER freq, t1, t2;
+static void WideToUtf8(char* out, size_t outsz, const wchar_t* in) {
+    WideCharToMultiByte(CP_UTF8, 0, in, -1, out, (int)outsz, NULL, NULL);
+}
 
-    swprintf(portStr, 16, L"%d", port);
-    memset(&hints, 0, sizeof(hints));
+static const char* MainJsContent =
+"const $=s=>document.querySelector(s);\n"
+"async function j(u,o){const r=await fetch(u,o); return await r.json();}\n"
+"function row(r){const tr=document.createElement('tr');\n"
+"tr.innerHTML=`<td>${r.time}</td><td>${r.a}</td><td>${r.b}</td><td><div class='bar a' style='height:${r.ah||0}px'></div></td><td><div class='bar b' style='height:${r.bh||0}px'></div></td><td>${r.note}</td>`; return tr;}\n"
+"async function refresh(){const s=await j('/api/status');\n"
+"$('#state').textContent=s.running?'Running':'Stopped';\n"
+"$('#stats').textContent=`A ${s.a.ok}/${s.a.fail} last ${s.a.last_ms} ms | B ${s.b.ok}/${s.b.fail} last ${s.b.last_ms} ms`;\n"
+"$('#lastlog').textContent=s.last_log||'';\n"
+"const tb=$('#tbody'); tb.innerHTML=''; (s.rows||[]).forEach(x=>tb.appendChild(row(x)));\n"
+"$('#oplog').value=s.op_log||''; $('#dbglog').value=s.dbg_log||'';}\n"
+"async function start(){const f=new FormData($('#form')); const o={}; for(const [k,v] of f.entries()) o[k]=v; await j('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)}); refresh();}\n"
+"async function stop(){await j('/api/stop',{method:'POST'}); refresh();}\n"
+"window.onload=()=>{$('#start').onclick=start; $('#stop').onclick=stop; setInterval(refresh,1000); refresh();};\n";
+
+static char* FindHeader(char* req, const char* name) {
+    size_t n = strlen(name);
+    char* p = req;
+    while ((p = strstr(p, name)) != NULL) {
+        if ((p == req || p[-1] == '\n') && p[n] == ':') return p + n + 1;
+        p++;
+    }
+    return NULL;
+}
+
+static int ParseContentLength(const char* req) {
+    const char* p = strstr(req, "Content-Length:");
+    if (!p) p = strstr(req, "content-length:");
+    if (!p) return 0;
+    p += 15;
+    while (*p == ' ' || *p == '\t') p++;
+    return atoi(p);
+}
+
+static void UrlDecodeInPlace(char* s) {
+    char* o = s;
+    while (*s) {
+        if (*s == '%' && s[1] && s[2]) {
+            char hex[3] = { s[1], s[2], 0 };
+            *o++ = (char)strtol(hex, NULL, 16);
+            s += 3;
+        } else if (*s == '+') {
+            *o++ = ' ';
+            s++;
+        } else {
+            *o++ = *s++;
+        }
+    }
+    *o = 0;
+}
+
+static void ExtractFormValue(const char* body, const char* key, char* out, int outsz) {
+    out[0] = 0;
+    const char* p = strstr(body, key);
+    if (!p) return;
+    p += strlen(key);
+    if (*p != '=') return;
+    p++;
+    const char* e = strchr(p, '&');
+    if (!e) e = p + strlen(p);
+    int n = (int)(e - p);
+    if (n >= outsz) n = outsz - 1;
+    memcpy(out, p, n);
+    out[n] = 0;
+    UrlDecodeInPlace(out);
+}
+
+static void ExtractJsonValue(const char* body, const char* key, char* out, int outsz) {
+    out[0] = 0;
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char* p = strstr(body, pat);
+    if (!p) return;
+    p = strchr(p, ':');
+    if (!p) return;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '"') {
+        p++;
+        const char* e = p;
+        while (*e && !(*e == '"' && e[-1] != '\\')) e++;
+        int n = (int)(e - p);
+        if (n >= outsz) n = outsz - 1;
+        memcpy(out, p, n);
+        out[n] = 0;
+    } else {
+        const char* e = p;
+        while (*e && *e != ',' && *e != '}' && *e != '\r' && *e != '\n') e++;
+        int n = (int)(e - p);
+        if (n >= outsz) n = outsz - 1;
+        memcpy(out, p, n);
+        out[n] = 0;
+    }
+}
+
+static int SendAll(SOCKET s, const char* data, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = send(s, data + sent, len - sent, 0);
+        if (n <= 0) return 0;
+        sent += n;
+    }
+    return 1;
+}
+
+static void SendHttpText(SOCKET s, const char* code, const char* ctype, const char* body) {
+    char hdr[512];
+    int blen = (int)strlen(body);
+    _snprintf(hdr, sizeof(hdr),
+              "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+              code, ctype, blen);
+    SendAll(s, hdr, (int)strlen(hdr));
+    SendAll(s, body, blen);
+}
+
+static void BuildStatusJson(char* out, size_t outsz) {
+    char op[MAX_LOG * 2] = {0}, dbg[MAX_LOG * 2] = {0}, last[512] = {0};
+    char ahost[256], bhost[256], note[512];
+    WideToUtf8(ahost, sizeof(ahost), g_a_host);
+    WideToUtf8(bhost, sizeof(bhost), g_b_host);
+    WideToUtf8(note, sizeof(note), g_last_note);
+
+    EnterCriticalSection(&g_log_cs);
+    WideToUtf8(op, sizeof(op), g_log_op);
+    WideToUtf8(dbg, sizeof(dbg), g_log_dbg);
+    LeaveCriticalSection(&g_log_cs);
+
+    EnterCriticalSection(&g_data_cs);
+    int n = _snprintf(out, outsz,
+        "{"
+        "\"running\":%s,"
+        "\"server_port\":%u,"
+        "\"a\":{\"host\":\"%s\",\"port\":\"%s\",\"ok\":%lld,\"fail\":%lld,\"last_ms\":%.1f},"
+        "\"b\":{\"host\":\"%s\",\"port\":\"%s\",\"ok\":%lld,\"fail\":%lld,\"last_ms\":%.1f},"
+        "\"last_log\":\"",
+        g_running ? "true" : "false", g_server_port,
+        ahost, g_a_port, g_a_ok, g_a_fail, g_a_last,
+        bhost, g_b_port, g_b_ok, g_b_fail, g_b_last);
+    if (n < 0) n = 0;
+    char* p = out + n;
+    JsonEscapeAppend(p, outsz - (size_t)(p - out), note);
+    p = out + strlen(out);
+    _snprintf(p, outsz - (size_t)(p - out), "\",\"rows\":[");
+    for (int i = 0; i < g_row_count; i++) {
+        char t[128], aa[128], bb[128], ab[256], bb2[256], no[256];
+        WideToUtf8(t, sizeof(t), g_rows[i].time);
+        WideToUtf8(aa, sizeof(aa), g_rows[i].a);
+        WideToUtf8(bb, sizeof(bb), g_rows[i].b);
+        WideToUtf8(ab, sizeof(ab), g_rows[i].abar);
+        WideToUtf8(bb2, sizeof(bb2), g_rows[i].bbar);
+        WideToUtf8(no, sizeof(no), g_rows[i].note);
+        char row[1024];
+        _snprintf(row, sizeof(row), "%s{\"time\":\"%s\",\"a\":\"%s\",\"b\":\"%s\",\"abar\":\"%s\",\"bbar\":\"%s\",\"note\":\"%s\",\"ah\":%d,\"bh\":%d}",
+                  i ? "," : "", t, aa, bb, ab, bb2, no,
+                  (int)((g_a_last < 0 ? 0 : g_a_last) > 200 ? 200 : (g_a_last < 0 ? 0 : g_a_last)),
+                  (int)((g_b_last < 0 ? 0 : g_b_last) > 200 ? 200 : (g_b_last < 0 ? 0 : g_b_last)));
+        strncat(out, row, outsz - strlen(out) - 1);
+    }
+    strncat(out, "],\"op_log\":\"", outsz - strlen(out) - 1);
+    JsonEscapeAppend(out, outsz, L""); /* no-op to satisfy structure */
+    char tmp[64];
+    tmp[0] = 0;
+    char* tail = out + strlen(out);
+    JsonEscapeAppend(tail, outsz - (size_t)(tail - out), L"");
+    strncat(out, op, outsz - strlen(out) - 1);
+    tail = out + strlen(out);
+    JsonEscapeAppend(tail, outsz - (size_t)(tail - out), L"");
+    strncat(out, "\",\"dbg_log\":\"", outsz - strlen(out) - 1);
+    strncat(out, dbg, outsz - strlen(out) - 1);
+    strncat(out, "\"}", outsz - strlen(out) - 1);
+    LeaveCriticalSection(&g_data_cs);
+}
+
+static int TcpPingOne(const wchar_t* host, const wchar_t* port, double* ms_out) {
+    struct addrinfo hints, *res = NULL, *rp = NULL;
+    SOCKET s = INVALID_SOCKET;
+    char host8[128], port8[16];
+    WideToUtf8(host8, sizeof(host8), host);
+    WideToUtf8(port8, sizeof(port8), port);
+
+    ZeroMemory(&hints, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
-    if (GetAddrInfoW(host, portStr, &hints, &res) != 0) {
-        return -1;
+    if (getaddrinfo(host8, port8, &hints, &res) != 0) return 0;
+
+    for (rp = res; rp; rp = rp->ai_next) {
+        s = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (s == INVALID_SOCKET) continue;
+
+        DWORD tv = 1000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+
+        LARGE_INTEGER f, t1, t2;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t1);
+
+        int rc = connect(s, rp->ai_addr, (int)rp->ai_addrlen);
+
+        QueryPerformanceCounter(&t2);
+        closesocket(s);
+        s = INVALID_SOCKET;
+
+        if (rc == 0) {
+            *ms_out = (double)(t2.QuadPart - t1.QuadPart) * 1000.0 / (double)f.QuadPart;
+            freeaddrinfo(res);
+            return 1;
+        }
     }
 
-    QueryPerformanceFrequency(&freq);
+    freeaddrinfo(res);
+    return 0;
+}
 
-    for (it = res; it != NULL; it = it->ai_next) {
-        sock = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-        if (sock == INVALID_SOCKET) continue;
+static unsigned __stdcall PingThread(void* arg) {
+    (void)arg;
+    LogOp(L"Ping started");
+    while (!g_should_stop) {
+        wchar_t a_ms[32] = L"timeout";
+        wchar_t b_ms[32] = L"timeout";
+        wchar_t note[128] = L"";
 
-        u_long nb = 1;
-        ioctlsocket(sock, FIONBIO, &nb);
+        double am = -1.0, bm = -1.0;
+        int aok = TcpPingOne(g_a_host, g_a_port, &am);
+        int bok = TcpPingOne(g_b_host, g_b_port, &bm);
 
-        QueryPerformanceCounter(&t1);
-        connect(sock, it->ai_addr, (int)it->ai_addrlen);
+        EnterCriticalSection(&g_data_cs);
+        if (aok) { g_a_ok++; g_a_last = am; swprintf(a_ms, 32, L"%.1f", am); }
+        else { g_a_fail++; g_a_last = -1.0; }
 
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(sock, &wfds);
+        if (bok) { g_b_ok++; g_b_last = bm; swprintf(b_ms, 32, L"%.1f", bm); }
+        else { g_b_fail++; g_b_last = -1.0; }
 
-        struct timeval tv;
-        tv.tv_sec = 2;
-        tv.tv_usec = 0;
+        if (aok && bok) {
+            swprintf(note, 128, L"Δ %.1f ms", am - bm);
+            wcsncpy(g_last_note, note, 255);
+        } else if (!aok && !bok) {
+            wcscpy(g_last_note, L"Both timeout");
+        } else if (!aok) {
+            wcscpy(g_last_note, L"A timeout");
+        } else {
+            wcscpy(g_last_note, L"B timeout");
+        }
+        LeaveCriticalSection(&g_data_cs);
 
-        int r = select(0, NULL, &wfds, NULL, &tv);
-        QueryPerformanceCounter(&t2);
+        AddResultRow(a_ms, b_ms,
+                     (aok ? L"|" : L""),
+                     (bok ? L"|" : L""),
+                     note[0] ? note : L"");
+        UpdateListView();
+        SetStatusText();
 
-        if (r > 0 && FD_ISSET(sock, &wfds)) {
-            int so_error = 0;
-            int slen = sizeof(so_error);
-            getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&so_error, &slen);
-            if (so_error == 0) {
-                *elapsed = (double)(t2.QuadPart - t1.QuadPart) * 1000.0 / (double)freq.QuadPart;
-                closesocket(sock);
-                FreeAddrInfoW(res);
-                return 0;
+        Sleep(1000);
+    }
+
+    LogOp(L"Ping stopped");
+    g_ping_thread = NULL;
+    return 0;
+}
+
+static int HandleRequest(SOCKET s, char* req) {
+    char method[8] = {0}, path[256] = {0};
+    sscanf(req, "%7s %255s", method, path);
+
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
+        const char* html =
+"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>TCPing GUI</title><style>"
+"body{font-family:Segoe UI,Arial,sans-serif;background:#f5f7fb;color:#1f2937;margin:12px}"
+".row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}"
+"input,button,textarea{font:13px Segoe UI,Arial;padding:6px 8px;border:1px solid #cfd8e3;border-radius:6px;background:#fff}"
+"button{background:#e9eef8;cursor:pointer}"
+"button:hover{background:#dfe8f8}"
+"table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #d8e0ea}"
+"th,td{font-size:12px;border-bottom:1px solid #edf1f5;padding:5px 6px;text-align:left;vertical-align:bottom}"
+".bars{display:flex;gap:10px;align-items:flex-end;height:34px}"
+".bar{width:12px;border-radius:4px 4px 0 0;opacity:.9}"
+".a{background:#2b7cff}.b{background:#ff9800}"
+".panel{background:#fff;border:1px solid #d8e0ea;border-radius:8px;padding:8px;margin-top:8px}"
+".status{padding:8px;background:#eef3fb;border:1px solid #ced9ea;border-radius:8px;margin:8px 0;font-size:12px}"
+"textarea{width:100%;height:120px;resize:vertical;white-space:pre;font-family:Consolas,monospace}"
+"label{font-size:12px;color:#4b5563}"
+"</style></head><body>"
+"<div class='row'><label>Target A<br><input id='a' name='a' value='8.8.8.8'></label>"
+"<label>Port A<br><input id='ap' name='ap' value='53' style='width:80px'></label>"
+"<label>Target B<br><input id='b' name='b' value='1.1.1.1'></label>"
+"<label>Port B<br><input id='bp' name='bp' value='53' style='width:80px'></label>"
+"<label>Duration<br><input id='d' name='d' value='30' style='width:80px'></label>"
+"<div style='display:flex;align-items:end;gap:8px'><button id='start'>Start</button><button id='stop'>Stop</button></div></div>"
+"<div class='status'><span id='state'>Stopped</span> | <span id='stats'></span> | <span id='lastlog'></span></div>"
+"<div class='panel'><table><thead><tr><th>Time</th><th>A</th><th>B</th><th>A Bar</th><th>B Bar</th><th>Note</th></tr></thead><tbody id='tbody'></tbody></table></div>"
+"<div class='panel'><div style='font-size:12px;margin-bottom:4px'>Operational Log</div><textarea id='oplog' readonly></textarea></div>"
+"<div class='panel'><div style='font-size:12px;margin-bottom:4px'>Debug Log</div><textarea id='dbglog' readonly></textarea></div>"
+"<script src='/main.js'></script></body></html>";
+        SendHttpText(s, "200 OK", "text/html; charset=utf-8", html);
+        return 1;
+    }
+
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/main.js") == 0) {
+        SendHttpText(s, "200 OK", "application/javascript; charset=utf-8", MainJsContent);
+        return 1;
+    }
+
+    if (strcmp(method, "GET") == 0 && strcmp(path, "/api/status") == 0) {
+        char json[8192];
+        json[0] = 0;
+        BuildStatusJson(json, sizeof(json));
+        SendHttpText(s, "200 OK", "application/json; charset=utf-8", json);
+        return 1;
+    }
+
+    if (strcmp(method, "POST") == 0 && (strcmp(path, "/api/start") == 0 || strcmp(path, "/api/stop") == 0)) {
+        if (strcmp(path, "/api/stop") == 0) {
+            g_should_stop = 1;
+            if (g_ping_thread) {
+                WaitForSingleObject(g_ping_thread, INFINITE);
+                CloseHandle(g_ping_thread);
+                g_ping_thread = NULL;
             }
+            g_running = 0;
+            LogOp(L"Stopped");
+            SetStatusText();
+            SendHttpText(s, "200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+            return 1;
         }
 
-        closesocket(sock);
-        sock = INVALID_SOCKET;
+        int content_len = ParseContentLength(req);
+        char* body = strstr(req, "\r\n\r\n");
+        if (!body) {
+            SendHttpText(s, "400 Bad Request", "application/json; charset=utf-8", "{\"ok\":false}");
+            return 1;
+        }
+        body += 4;
+
+        char a[128]={0}, ap[16]={0}, b[128]={0}, bp[16]={0}, d[16]={0};
+        if (strstr(req, "application/json")) {
+            ExtractJsonValue(body, "a", a, sizeof(a));
+            ExtractJsonValue(body, "ap", ap, sizeof(ap));
+            ExtractJsonValue(body, "b", b, sizeof(b));
+            ExtractJsonValue(body, "bp", bp, sizeof(bp));
+            ExtractJsonValue(body, "d", d, sizeof(d));
+        } else {
+            ExtractFormValue(body, "a", a, sizeof(a));
+            ExtractFormValue(body, "ap", ap, sizeof(ap));
+            ExtractFormValue(body, "b", b, sizeof(b));
+            ExtractFormValue(body, "bp", bp, sizeof(bp));
+            ExtractFormValue(body, "d", d, sizeof(d));
+        }
+
+        if (a[0]) MultiByteToWideChar(CP_UTF8, 0, a, -1, g_a_host, 128);
+        if (ap[0]) MultiByteToWideChar(CP_UTF8, 0, ap, -1, g_a_port, 16);
+        if (b[0]) MultiByteToWideChar(CP_UTF8, 0, b, -1, g_b_host, 128);
+        if (bp[0]) MultiByteToWideChar(CP_UTF8, 0, bp, -1, g_b_port, 16);
+        if (d[0]) g_duration = atoi(d);
+
+        EnterCriticalSection(&g_data_cs);
+        g_a_ok = g_a_fail = g_b_ok = g_b_fail = 0;
+        g_a_last = g_b_last = -1.0;
+        wcscpy(g_last_note, L"Running");
+        g_row_count = 0;
+        LeaveCriticalSection(&g_data_cs);
+
+        g_should_stop = 0;
+        g_running = 1;
+        if (!g_ping_thread) {
+            unsigned tid = 0;
+            g_ping_thread = (HANDLE)_beginthreadex(NULL, 0, PingThread, NULL, 0, &tid);
+        }
+
+        LogOp(L"Start A=%s:%s B=%s:%s Duration=%d", g_a_host, g_a_port, g_b_host, g_b_port, g_duration);
+        SetStatusText();
+        SendHttpText(s, "200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        return 1;
     }
 
-    if (res) FreeAddrInfoW(res);
-    return -1;
+    SendHttpText(s, "404 Not Found", "text/plain; charset=utf-8", "not found");
+    return 1;
+}
+
+static unsigned __stdcall ServerThread(void* arg) {
+    (void)arg;
+    char buf[8192];
+    struct sockaddr_in addr;
+    SOCKET client;
+
+    for (UINT p = SERVER_PORT_BASE; p <= SERVER_PORT_MAX; p++) {
+        g_listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (g_listen_sock == INVALID_SOCKET) continue;
+
+        BOOL yes = TRUE;
+        setsockopt(g_listen_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+
+        ZeroMemory(&addr, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons((u_short)p);
+
+        if (bind(g_listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == 0 && listen(g_listen_sock, 8) == 0) {
+            g_server_port = p;
+            break;
+        }
+        closesocket(g_listen_sock);
+        g_listen_sock = INVALID_SOCKET;
+    }
+
+    if (g_listen_sock == INVALID_SOCKET) {
+        LogOp(L"Server bind failed");
+        return 0;
+    }
+
+    LogOp(L"Server listening on 127.0.0.1:%u", g_server_port);
+    SetStatusText();
+
+    ShellExecuteW(NULL, L"open", L"http://127.0.0.1:38000", NULL, NULL, SW_SHOWNORMAL);
+
+    while (!g_should_stop) {
+        fd_set rfds;
+        struct timeval tv;
+        FD_ZERO(&rfds);
+        FD_SET(g_listen_sock, &rfds);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        int sel = select(0, &rfds, NULL, NULL, &tv);
+        if (sel > 0 && FD_ISSET(g_listen_sock, &rfds)) {
+            client = accept(g_listen_sock, NULL, NULL);
+            if (client != INVALID_SOCKET) {
+                int n = recv(client, buf, sizeof(buf) - 1, 0);
+                if (n > 0) {
+                    buf[n] = 0;
+                    HandleRequest(client, buf);
+                }
+                closesocket(client);
+            }
+        }
+    }
+
+    if (g_listen_sock != INVALID_SOCKET) {
+        closesocket(g_listen_sock);
+        g_listen_sock = INVALID_SOCKET;
+    }
+    LogOp(L"Server stopped");
+    return 0;
+}
+
+static void TrayAdd(HWND hwnd) {
+    NOTIFYICONDATAW nid;
+    ZeroMemory(&nid, sizeof(nid));
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = ID_TRAYICON;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAYICON;
+    nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    lstrcpyW(nid.szTip, L"TCPing GUI");
+    Shell_NotifyIconW(NIM_ADD, &nid);
+}
+
+static void TrayDel(HWND hwnd) {
+    NOTIFYICONDATAW nid;
+    ZeroMemory(&nid, sizeof(nid));
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = ID_TRAYICON;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
+static void ShowMainWindow(HWND hwnd) {
+    ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd);
+}
+
+static void StartServerAndUi(void) {
+    if (!g_server_thread) {
+        unsigned tid = 0;
+        g_server_thread = (HANDLE)_beginthreadex(NULL, 0, ServerThread, NULL, 0, &tid);
+    }
+}
+
+static void StopAll(void) {
+    g_should_stop = 1;
+    if (g_ping_thread) {
+        WaitForSingleObject(g_ping_thread, INFINITE);
+        CloseHandle(g_ping_thread);
+        g_ping_thread = NULL;
+    }
+    if (g_server_thread) {
+        WaitForSingleObject(g_server_thread, INFINITE);
+        CloseHandle(g_server_thread);
+        g_server_thread = NULL;
+    }
+    g_running = 0;
+}
+
+static void CreateControls(HWND hwnd) {
+    g_editAHost = CreateWindowW(L"EDIT", L"8.8.8.8", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 10, 10, 140, 24, hwnd, NULL, NULL, NULL);
+    g_editAPort = CreateWindowW(L"EDIT", L"53", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 160, 10, 60, 24, hwnd, NULL, NULL, NULL);
+    g_editBHost = CreateWindowW(L"EDIT", L"1.1.1.1", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 230, 10, 140, 24, hwnd, NULL, NULL, NULL);
+    g_editBPort = CreateWindowW(L"EDIT", L"53", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 380, 10, 60, 24, hwnd, NULL, NULL, NULL);
+    g_editDur   = CreateWindowW(L"EDIT", L"30", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 450, 10, 60, 24, hwnd, NULL, NULL, NULL);
+
+    g_btnStart = CreateWindowW(L"BUTTON", L"Start", WS_CHILD|WS_VISIBLE, 520, 10, 70, 24, hwnd, (HMENU)1, NULL, NULL);
+    g_btnStop  = CreateWindowW(L"BUTTON", L"Stop",  WS_CHILD|WS_VISIBLE, 595, 10, 70, 24, hwnd, (HMENU)2, NULL, NULL);
+    g_btnShow  = CreateWindowW(L"BUTTON", L"Show",  WS_CHILD|WS_VISIBLE, 670, 10, 70, 24, hwnd, (HMENU)3, NULL, NULL);
+
+    g_status = CreateWindowW(L"STATIC", L"Stopped", WS_CHILD|WS_VISIBLE, 10, 42, 760, 20, hwnd, NULL, NULL, NULL);
+
+    g_list = CreateWindowW(WC_LISTVIEWW, NULL, WS_CHILD|WS_VISIBLE|LVS_REPORT|LVS_SINGLESEL, 10, 66, 760, 200, hwnd, NULL, NULL, NULL);
+    ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT|LVS_EX_GRIDLINES);
+
+    LVCOLUMNW c;
+    ZeroMemory(&c, sizeof(c));
+    c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+
+    c.pszText = L"Time"; c.cx = 80; ListView_InsertColumn(g_list, 0, &c);
+    c.pszText = L"A"; c.cx = 90; c.iSubItem = 1; ListView_InsertColumn(g_list, 1, &c);
+    c.pszText = L"B"; c.cx = 90; c.iSubItem = 2; ListView_InsertColumn(g_list, 2, &c);
+    c.pszText = L"A Bar"; c.cx = 120; c.iSubItem = 3; ListView_InsertColumn(g_list, 3, &c);
+    c.pszText = L"B Bar"; c.cx = 120; c.iSubItem = 4; ListView_InsertColumn(g_list, 4, &c);
+    c.pszText = L"Note"; c.cx = 250; c.iSubItem = 5; ListView_InsertColumn(g_list, 5, &c);
+
+    g_log_op = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL, 10, 275, 370, 160, hwnd, NULL, NULL, NULL);
+    g_log_dbg = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL, 400, 275, 370, 160, hwnd, NULL, NULL, NULL);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-    case WM_CREATE: {
-        CreateWindowW(L"Button", L"参数设置", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                      14, 12, 772, 130, hwnd, NULL, GetModuleHandleW(NULL), NULL);
-
-        CreateWindowW(L"Static", L"IP/域名:", WS_CHILD | WS_VISIBLE,
-                      34, 42, 80, 22, hwnd, NULL, NULL, NULL);
-        hIpEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"Edit", L"360.com",
-                      WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                      120, 38, 250, 26, hwnd, (HMENU)IDC_IPEDIT, GetModuleHandleW(NULL), NULL);
-
-        CreateWindowW(L"Static", L"端口:", WS_CHILD | WS_VISIBLE,
-                      390, 42, 40, 22, hwnd, NULL, NULL, NULL);
-        hPortEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"Edit", L"80",
-                      WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
-                      440, 38, 90, 26, hwnd, (HMENU)IDC_PORTEDIT, GetModuleHandleW(NULL), NULL);
-
-        CreateWindowW(L"Static", L"次数:", WS_CHILD | WS_VISIBLE,
-                      550, 42, 40, 22, hwnd, NULL, NULL, NULL);
-        hCountEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"Edit", L"4",
-                      WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
-                      600, 38, 90, 26, hwnd, (HMENU)IDC_COUNTEDIT, GetModuleHandleW(NULL), NULL);
-
-        hStartButton = CreateWindowW(L"Button", L"开始",
-                      WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                      120, 78, 120, 30, hwnd, (HMENU)IDC_STARTBUTTON, GetModuleHandleW(NULL), NULL);
-
-        hStopButton = CreateWindowW(L"Button", L"停止",
-                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
-                      260, 78, 120, 30, hwnd, (HMENU)IDC_STOPBUTTON, GetModuleHandleW(NULL), NULL);
-
-        CreateWindowW(L"Button", L"日志输出", WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                      14, 154, 772, 440, hwnd, NULL, GetModuleHandleW(NULL), NULL);
-
-        hLogEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"Edit", L"",
-                      WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-                      28, 178, 744, 400, hwnd, (HMENU)IDC_LOGEDIT, GetModuleHandleW(NULL), NULL);
-
+    case WM_CREATE:
+        CreateControls(hwnd);
+        TrayAdd(hwnd);
+        StartServerAndUi();
         return 0;
-    }
 
-    case WM_COMMAND: {
+    case WM_COMMAND:
         switch (LOWORD(wParam)) {
-        case IDC_STARTBUTTON:
-            StartPing();
-            break;
-        case IDC_STOPBUTTON:
-            StopPing();
-            break;
-        case ID_MENU_COPY:
-            SendMessageW(hLogEdit, WM_COPY, 0, 0);
-            break;
-        case ID_MENU_SELECT_ALL:
-            SendMessageW(hLogEdit, EM_SETSEL, 0, -1);
-            break;
+        case 1:
+            GetWindowTextW(g_editAHost, g_a_host, 128);
+            GetWindowTextW(g_editAPort, g_a_port, 16);
+            GetWindowTextW(g_editBHost, g_b_host, 128);
+            GetWindowTextW(g_editBPort, g_b_port, 16);
+            {
+                wchar_t d[16];
+                GetWindowTextW(g_editDur, d, 16);
+                g_duration = _wtoi(d);
+            }
+            g_should_stop = 0;
+            g_running = 1;
+            if (!g_ping_thread) {
+                unsigned tid = 0;
+                g_ping_thread = (HANDLE)_beginthreadex(NULL, 0, PingThread, NULL, 0, &tid);
+            }
+            LogOp(L"Manual start");
+            SetStatusText();
+            return 0;
+        case 2:
+            g_should_stop = 1;
+            if (g_ping_thread) {
+                WaitForSingleObject(g_ping_thread, INFINITE);
+                CloseHandle(g_ping_thread);
+                g_ping_thread = NULL;
+            }
+            g_running = 0;
+            LogOp(L"Manual stop");
+            SetStatusText();
+            return 0;
+        case 3:
+            ShowMainWindow(hwnd);
+            return 0;
         }
-        return 0;
-    }
+        break;
 
-    case WM_CONTEXTMENU: {
-        if ((HWND)wParam == hLogEdit) {
-            HMENU hMenu = CreatePopupMenu();
-            AppendMenuW(hMenu, MF_STRING, ID_MENU_COPY, L"复制");
-            AppendMenuW(hMenu, MF_STRING, ID_MENU_SELECT_ALL, L"全选");
-
-            DWORD start = 0, end = 0;
-            SendMessageW(hLogEdit, EM_GETSEL, (WPARAM)&start, (LPARAM)&end);
-            if (start == end) EnableMenuItem(hMenu, ID_MENU_COPY, MF_BYCOMMAND | MF_GRAYED);
-
-            TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_TOPALIGN | TPM_LEFTALIGN,
-                           GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), 0, hwnd, NULL);
-            DestroyMenu(hMenu);
+    case WM_TRAYICON:
+        if (lParam == WM_LBUTTONDBLCLK) {
+            ShowMainWindow(hwnd);
+        } else if (lParam == WM_RBUTTONUP) {
+            POINT pt;
+            GetCursorPos(&pt);
+            HMENU m = CreatePopupMenu();
+            AppendMenuW(m, MF_STRING, 1, L"Show Window");
+            AppendMenuW(m, MF_STRING, 2, L"Start");
+            AppendMenuW(m, MF_STRING, 3, L"Stop");
+            AppendMenuW(m, MF_STRING, 4, L"Exit");
+            SetForegroundWindow(hwnd);
+            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+            DestroyMenu(m);
+            if (cmd == 1) ShowMainWindow(hwnd);
+            else if (cmd == 2) SendMessageW(hwnd, WM_COMMAND, 1, 0);
+            else if (cmd == 3) SendMessageW(hwnd, WM_COMMAND, 2, 0);
+            else if (cmd == 4) DestroyWindow(hwnd);
         }
-        return 0;
-    }
-
-    case WM_USER + 1:
-        PingThreadCleanup((PingStats*)lParam);
         return 0;
 
     case WM_DESTROY:
-        StopPing();
-        if (hFont) DeleteObject(hFont);
-        if (hFontBold) DeleteObject(hFontBold);
+        TrayDel(hwnd);
+        StopAll();
         PostQuitMessage(0);
         return 0;
-
-    case WM_GETMINMAXINFO: {
-        MINMAXINFO* mmi = (MINMAXINFO*)lParam;
-        mmi->ptMinTrackSize.x = 800;
-        mmi->ptMinTrackSize.y = 650;
-        mmi->ptMaxTrackSize.x = 800;
-        mmi->ptMaxTrackSize.y = 650;
-        return 0;
     }
-    }
-
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) {
-    (void)hPrevInstance;
-    (void)lpCmdLine;
-    (void)nCmdShow;
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show) {
+    (void)hPrev; (void)cmd; (void)show;
+    InitializeCriticalSection(&g_log_cs);
+    InitializeCriticalSection(&g_data_cs);
 
-    WSAData wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        MessageBoxW(NULL, L"WSAStartup 失败", L"错误", MB_ICONERROR);
-        return 1;
-    }
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
 
-    INITCOMMONCONTROLSEX icex;
-    icex.dwSize = sizeof(icex);
-    icex.dwICC = ICC_STANDARD_CLASSES;
-    InitCommonControlsEx(&icex);
+    INITCOMMONCONTROLSEX icc;
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_LISTVIEW_CLASSES;
+    InitCommonControlsEx(&icc);
 
-    WNDCLASSEXW wc;
-    memset(&wc, 0, sizeof(wc));
-    wc.cbSize = sizeof(wc);
+    WNDCLASSW wc;
+    ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInstance;
-    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.lpszClassName = L"TCPingWindowClass";
-    wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
-    wc.hIconSm = LoadIconW(NULL, IDI_APPLICATION);
+    wc.hInstance = hInst;
+    wc.lpszClassName = APP_CLASS;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    RegisterClassW(&wc);
 
-    if (!RegisterClassExW(&wc)) {
-        WSACleanup();
-        return 1;
-    }
-
-    g_hwnd = CreateWindowExW(
-        0, L"TCPingWindowClass", L"TCP Ping 工具",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 800, 650,
-        NULL, NULL, hInstance, NULL
-    );
-
-    if (!g_hwnd) {
-        WSACleanup();
-        return 1;
-    }
-
-    LOGFONTW lf;
-    memset(&lf, 0, sizeof(lf));
-    lf.lfHeight = -11;
-    lf.lfWeight = FW_NORMAL;
-    wcscpy_s(lf.lfFaceName, LF_FACESIZE, L"Segoe UI");
-    hFont = CreateFontIndirectW(&lf);
-    lf.lfWeight = FW_BOLD;
-    hFontBold = CreateFontIndirectW(&lf);
-
-    ShowWindow(g_hwnd, SW_SHOW);
-    UpdateWindow(g_hwnd);
-
-    SendMessageW(hIpEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
-    SendMessageW(hPortEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
-    SendMessageW(hCountEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
-    SendMessageW(hLogEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
-    SendMessageW(hStartButton, WM_SETFONT, (WPARAM)hFontBold, TRUE);
-    SendMessageW(hStopButton, WM_SETFONT, (WPARAM)hFontBold, TRUE);
-
-    SetWindowTextW(hLogEdit, L"就绪。");
+    HWND hwnd = CreateWindowW(APP_CLASS, APP_TITLE, WS_OVERLAPPEDWINDOW,
+                              CW_USEDEFAULT, CW_USEDEFAULT, 800, 480,
+                              NULL, NULL, hInst, NULL);
+    g_hwnd = hwnd;
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+    SetStatusText();
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
@@ -456,6 +849,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         DispatchMessageW(&msg);
     }
 
+    DeleteCriticalSection(&g_log_cs);
+    DeleteCriticalSection(&g_data_cs);
     WSACleanup();
     return 0;
 }
