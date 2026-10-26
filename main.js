@@ -10,6 +10,8 @@
     statsB: { sent: 0, ok: 0, fail: 0, min: null, max: null, avg: null }
   };
 
+  const DEFAULT_DURATION = 50;
+
   function esc(s) {
     return String(s ?? "")
       .replaceAll("&", "&amp;")
@@ -34,40 +36,42 @@
 
   function barHeight(ms) {
     if (ms == null || !isFinite(ms)) return 8;
-    const h = Math.max(8, Math.min(120, 8 + ms * 0.8));
-    return Math.round(h);
+    return Math.max(8, Math.min(120, Math.round(8 + ms * 0.8)));
   }
 
   function fmtMs(v) {
     if (v == null || !isFinite(v)) return "Timeout";
-    return `${v.toFixed(1)} ms`;
+    return `${Number(v).toFixed(1)} ms`;
   }
 
-  function avgFromRow(v) {
-    if (!v || !v.length) return null;
-    const sum = v.reduce((a, b) => a + b, 0);
-    return sum / v.length;
+  function avg(arr) {
+    if (!arr.length) return null;
+    return arr.reduce((a, b) => a + b, 0) / arr.length;
   }
 
   function recomputeStats() {
     const aOk = state.rows.map(r => r.a).filter(v => v != null && isFinite(v));
     const bOk = state.rows.map(r => r.b).filter(v => v != null && isFinite(v));
 
-    const aAll = state.rows.length;
-    const bAll = state.rows.length;
-
-    state.statsA.sent = aAll;
-    state.statsB.sent = bAll;
+    state.statsA.sent = state.rows.length;
+    state.statsB.sent = state.rows.length;
     state.statsA.ok = aOk.length;
     state.statsB.ok = bOk.length;
-    state.statsA.fail = aAll - aOk.length;
-    state.statsB.fail = bAll - bOk.length;
+    state.statsA.fail = state.rows.length - aOk.length;
+    state.statsB.fail = state.rows.length - bOk.length;
     state.statsA.min = aOk.length ? Math.min(...aOk) : null;
-    state.statsB.min = bOk.length ? Math.min(...bOk) : null;
     state.statsA.max = aOk.length ? Math.max(...aOk) : null;
+    state.statsA.avg = avg(aOk);
+    state.statsB.min = bOk.length ? Math.min(...bOk) : null;
     state.statsB.max = bOk.length ? Math.max(...bOk) : null;
-    state.statsA.avg = avgFromRow(aOk);
-    state.statsB.avg = avgFromRow(bOk);
+    state.statsB.avg = avg(bOk);
+  }
+
+  function renderStatus() {
+    $("statusRun").textContent = state.running ? "Running" : "Stopped";
+    $("statusA").textContent = `A: ${state.statsA.ok}/${state.statsA.sent} ok`;
+    $("statusB").textContent = `B: ${state.statsB.ok}/${state.statsB.sent} ok`;
+    $("statusLast").textContent = `Last: ${state.lastLog}`;
   }
 
   function renderTable() {
@@ -82,12 +86,8 @@
           <td class="time">${esc(r.time)}</td>
           <td class="num">${esc(fmtMs(r.a))}</td>
           <td class="num">${esc(fmtMs(r.b))}</td>
-          <td class="barcell">
-            <div class="${barClass(r.a)}" style="height:${aH}px"></div>
-          </td>
-          <td class="barcell">
-            <div class="${barClass(r.b)}" style="height:${bH}px"></div>
-          </td>
+          <td class="barcell"><div class="${barClass(r.a)}" style="height:${aH}px"></div></td>
+          <td class="barcell"><div class="${barClass(r.b)}" style="height:${bH}px"></div></td>
           <td class="note">${esc(r.note || "")}</td>
         </tr>
       `;
@@ -97,19 +97,9 @@
     renderStatus();
   }
 
-  function renderStatus() {
-    const a = state.statsA;
-    const b = state.statsB;
-
-    $("statusRun").textContent = state.running ? "Running" : "Stopped";
-    $("statusA").textContent = `A: ${a.ok}/${a.sent} ok`;
-    $("statusB").textContent = `B: ${b.ok}/${b.sent} ok`;
-    $("statusLast").textContent = `Last: ${state.lastLog}`;
-  }
-
   function renderLogs(op, dbg) {
-    if (typeof op === "string") $("logOp").value = op;
-    if (typeof dbg === "string") $("logDbg").value = dbg;
+    if (typeof op === "string" && $("logOp")) $("logOp").value = op;
+    if (typeof dbg === "string" && $("logDbg")) $("logDbg").value = dbg;
   }
 
   async function apiGet(path) {
@@ -153,12 +143,18 @@
     }
   }
 
-  async function startPing() {
+  function readInputs() {
     const targetA = $("targetA").value.trim();
     const portA = $("portA").value.trim();
     const targetB = $("targetB").value.trim();
     const portB = $("portB").value.trim();
-    const duration = $("duration").value.trim();
+    const duration = $("duration").value.trim() || String(DEFAULT_DURATION);
+
+    return { targetA, portA, targetB, portB, duration };
+  }
+
+  async function startPing() {
+    const { targetA, portA, targetB, portB, duration } = readInputs();
 
     if (!targetA || !portA || !targetB || !portB) {
       alert("Please fill Target A, Port A, Target B, Port B.");
@@ -171,7 +167,7 @@
         port_a: portA,
         target_b: targetB,
         port_b: portB,
-        duration: duration || "0"
+        duration: duration
       });
       state.running = true;
       state.lastLog = "started";
@@ -200,26 +196,26 @@
       renderTable();
     });
 
-    $("targetA").addEventListener("keydown", (e) => { if (e.key === "Enter") startPing(); });
-    $("portA").addEventListener("keydown", (e) => { if (e.key === "Enter") startPing(); });
-    $("targetB").addEventListener("keydown", (e) => { if (e.key === "Enter") startPing(); });
-    $("portB").addEventListener("keydown", (e) => { if (e.key === "Enter") startPing(); });
-    $("duration").addEventListener("keydown", (e) => { if (e.key === "Enter") startPing(); });
+    ["targetA", "portA", "targetB", "portB", "duration"].forEach(id => {
+      $(id).addEventListener("keydown", (e) => {
+        if (e.key === "Enter") startPing();
+      });
+    });
   }
 
   function injectStyle() {
     const css = document.createElement("style");
     css.textContent = `
       :root{
-        --bg:#f4f7fb;
-        --panel:#ffffff;
-        --line:#d9e1ea;
-        --text:#1f2a37;
-        --muted:#667085;
+        --bg:#f3f6fb;
+        --panel:#fff;
+        --line:#dbe3ec;
+        --text:#1f2937;
+        --muted:#6b7280;
         --blue:#2f80ed;
         --orange:#f2994a;
-        --good:#e8f3ff;
-        --bad:#fff1e6;
+        --green:#27ae60;
+        --red:#eb5757;
         --shadow:0 4px 18px rgba(18,28,45,.08);
       }
       *{box-sizing:border-box}
@@ -231,9 +227,9 @@
         font-size:13px;
       }
       .wrap{
-        max-width:1180px;
+        max-width:1280px;
         margin:0 auto;
-        padding:14px;
+        padding:12px;
       }
       .topbar,.panel,.statusbar{
         background:var(--panel);
@@ -257,7 +253,7 @@
         gap:5px;
         min-width:140px;
       }
-      .field.small{min-width:92px; width:92px;}
+      .field.small{min-width:92px;width:92px;}
       label{color:var(--muted); font-size:12px}
       input{
         height:32px;
@@ -267,7 +263,10 @@
         outline:none;
         background:#fff;
       }
-      input:focus{border-color:#9ec5ff; box-shadow:0 0 0 3px rgba(47,128,237,.12);}
+      input:focus{
+        border-color:#9ec5ff;
+        box-shadow:0 0 0 3px rgba(47,128,237,.12);
+      }
       button{
         height:32px;
         padding:0 14px;
@@ -276,11 +275,11 @@
         background:#fff;
         cursor:pointer;
       }
-      button.primary{background:#eaf2ff; border-color:#b8d3ff;}
-      button.danger{background:#fff0f0; border-color:#ffcbcb;}
+      button.primary{background:#eaf2ff;border-color:#b8d3ff;}
+      button.danger{background:#fff0f0;border-color:#ffcbcb;}
       .grid{
         display:grid;
-        grid-template-columns: 1fr;
+        grid-template-columns:1fr;
         gap:12px;
       }
       .panel{padding:10px 12px;}
@@ -306,9 +305,9 @@
         border-bottom:1px solid #eef2f7;
         vertical-align:middle;
       }
-      .num{width:110px; white-space:nowrap;}
-      .time{width:92px; white-space:nowrap;}
-      .barcell{width:72px; text-align:center;}
+      .num{width:110px;white-space:nowrap;}
+      .time{width:92px;white-space:nowrap;}
+      .barcell{width:72px;text-align:center;}
       .bar{
         width:18px;
         border-radius:6px 6px 2px 2px;
@@ -317,7 +316,7 @@
       }
       .bar.good{background:var(--blue);}
       .bar.mid{background:var(--orange);}
-      .bar.bad{background:#d9534f;}
+      .bar.bad{background:var(--red);}
       .bar.null{background:#cfd8e3;}
       textarea{
         width:100%;
@@ -374,7 +373,7 @@
             </div>
             <div class="field small">
               <label>Duration</label>
-              <input id="duration" value="0" />
+              <input id="duration" value="${DEFAULT_DURATION}" />
             </div>
             <button id="btnStart" class="primary">Start</button>
             <button id="btnStop" class="danger">Stop</button>
