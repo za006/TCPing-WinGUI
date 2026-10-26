@@ -1,20 +1,12 @@
-#define UNICODE
-#define _UNICODE
-#include <windows.h>
-#include <commctrl.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
+#include <commctrl.h>
 #include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
 #include <stdarg.h>
-#include <process.h>
-#include <stdint.h>
-
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "comctl32.lib")
-#pragma comment(lib, "shell32.lib")
 
 #define ID_EDIT_A      101
 #define ID_EDIT_B      102
@@ -33,6 +25,15 @@
 #define WM_APP_DONE         (WM_APP + 3)
 
 typedef struct {
+    int seq;
+    int side; // 0=A 1=B
+    double ms;
+    int ok;
+    wchar_t target[256];
+    wchar_t port[32];
+} RESULTITEM;
+
+typedef struct {
     HWND hWnd;
     HWND hEditA, hEditB, hEditPA, hEditPB, hEditDur;
     HWND hBtnStart, hBtnStop, hCmbMode;
@@ -43,15 +44,6 @@ typedef struct {
     HFONT hFont;
     HICON hIconLarge, hIconSmall;
 } APPSTATE;
-
-typedef struct {
-    int seq;
-    int side; // 0=A 1=B
-    double ms;
-    int ok;
-    WCHAR target[256];
-    WCHAR port[32];
-} RESULTITEM;
 
 static APPSTATE g;
 
@@ -79,14 +71,15 @@ static void list_add_result(const RESULTITEM* r) {
     wcscpy(ok, r->ok ? L"OK" : L"Fail");
 
     int idx = ListView_GetItemCount(g.hList);
-    LVITEMW it = {0};
+    LVITEMW it;
+    ZeroMemory(&it, sizeof(it));
     it.mask = LVIF_TEXT;
     it.iItem = idx;
     it.pszText = seq;
-    ListView_InsertItemW(g.hList, &it);
+    ListView_InsertItem(g.hList, &it);
     ListView_SetItemText(g.hList, idx, 1, side);
-    ListView_SetItemText(g.hList, idx, 2, (WCHAR*)r->target);
-    ListView_SetItemText(g.hList, idx, 3, (WCHAR*)r->port);
+    ListView_SetItemText(g.hList, idx, 2, (LPWSTR)r->target);
+    ListView_SetItemText(g.hList, idx, 3, (LPWSTR)r->port);
     ListView_SetItemText(g.hList, idx, 4, ms);
     ListView_SetItemText(g.hList, idx, 5, ok);
     ListView_EnsureVisible(g.hList, idx, FALSE);
@@ -132,8 +125,10 @@ static int tcp_connect_ms(const wchar_t* host, const wchar_t* port, double* out_
         }
 
         fd_set wfds, efds;
-        FD_ZERO(&wfds); FD_ZERO(&efds);
-        FD_SET(s, &wfds); FD_SET(s, &efds);
+        FD_ZERO(&wfds);
+        FD_ZERO(&efds);
+        FD_SET(s, &wfds);
+        FD_SET(s, &efds);
 
         TIMEVAL tv;
         tv.tv_sec = 2;
@@ -181,42 +176,24 @@ static DWORD WINAPI worker_thread(LPVOID param) {
         DWORD now = GetTickCount();
         if ((now - start) >= (DWORD)(dur * 1000)) break;
 
-        RESULTITEM r;
-        ZeroMemory(&r, sizeof(r));
-
-        r.seq = seq++;
-        r.side = 0;
-        wcscpy(r.target, a);
-        wcscpy(r.port, pa);
-
-        double ms = 0.0;
-        int ok = tcp_connect_ms(a, pa, &ms);
-        r.ok = ok;
-        r.ms = ms;
-        PostMessageW(g.hWnd, WM_APP_ADD_RESULT, 0, (LPARAM)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(RESULTITEM)));
-        RESULTITEM* copy = (RESULTITEM*)GetWindowLongPtrW(g.hWnd, GWLP_USERDATA);
-        (void)copy;
-        PostMessageW(g.hWnd, WM_APP_ADD_RESULT, 0, (LPARAM)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(RESULTITEM)));
-
-        RESULTITEM* p1 = (RESULTITEM*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(RESULTITEM));
-        if (p1) {
-            *p1 = r;
-            PostMessageW(g.hWnd, WM_APP_ADD_RESULT, 0, (LPARAM)p1);
+        RESULTITEM* r1 = (RESULTITEM*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(RESULTITEM));
+        if (r1) {
+            r1->seq = seq++;
+            r1->side = 0;
+            wcscpy(r1->target, a);
+            wcscpy(r1->port, pa);
+            r1->ok = tcp_connect_ms(a, pa, &r1->ms);
+            PostMessageW(g.hWnd, WM_APP_ADD_RESULT, 0, (LPARAM)r1);
         }
 
-        r.seq = seq++;
-        r.side = 1;
-        wcscpy(r.target, b);
-        wcscpy(r.port, pb);
-        ms = 0.0;
-        ok = tcp_connect_ms(b, pb, &ms);
-        r.ok = ok;
-        r.ms = ms;
-
-        RESULTITEM* p2 = (RESULTITEM*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(RESULTITEM));
-        if (p2) {
-            *p2 = r;
-            PostMessageW(g.hWnd, WM_APP_ADD_RESULT, 0, (LPARAM)p2);
+        RESULTITEM* r2 = (RESULTITEM*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(RESULTITEM));
+        if (r2) {
+            r2->seq = seq++;
+            r2->side = 1;
+            wcscpy(r2->target, b);
+            wcscpy(r2->port, pb);
+            r2->ok = tcp_connect_ms(b, pb, &r2->ms);
+            PostMessageW(g.hWnd, WM_APP_ADD_RESULT, 0, (LPARAM)r2);
         }
 
         Sleep(50);
@@ -243,7 +220,7 @@ static void layout(HWND hWnd) {
     int editw = 130;
 
     MoveWindow(GetDlgItem(hWnd, ID_EDIT_A), m + labelw, top, editw, rowh, TRUE);
-    MoveWindow(GetDlgItem(hWnd, ID_EDIT_PA), m + labelw + editw + 8 + 40, top, 70, rowh, TRUE);
+    MoveWindow(GetDlgItem(hWnd, ID_EDIT_PA), m + labelw + editw + 48, top, 70, rowh, TRUE);
     MoveWindow(GetDlgItem(hWnd, ID_EDIT_B), m + labelw + editw + 8 + 40 + 70 + 80, top, editw, rowh, TRUE);
     MoveWindow(GetDlgItem(hWnd, ID_EDIT_PB), m + labelw + editw + 8 + 40 + 70 + 80 + editw + 8, top, 70, rowh, TRUE);
 
@@ -270,10 +247,7 @@ static HICON load_icon_from_file(void) {
     wchar_t* p = wcsrchr(path, L'\\');
     if (p) *(p + 1) = 0;
     wcscat(path, L"TCPing_GUI.ico");
-
-    HICON ic = (HICON)LoadImageW(NULL, path, IMAGE_ICON, 32, 32, LR_LOADFROMFILE | LR_DEFAULTSIZE);
-    if (!ic) ic = (HICON)LoadImageW(NULL, path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE | LR_DEFAULTSIZE);
-    return ic;
+    return (HICON)LoadImageW(NULL, path, IMAGE_ICON, 32, 32, LR_LOADFROMFILE | LR_DEFAULTSIZE);
 }
 
 static void init_controls(HWND hWnd) {
@@ -320,23 +294,25 @@ static void init_controls(HWND hWnd) {
     set_font(g.hList); set_font(g.hLog); set_font(g.hStatus);
 
     ListView_SetExtendedListViewStyle(g.hList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-    LVCOLUMNW col = {0};
+
+    LVCOLUMNW col;
+    ZeroMemory(&col, sizeof(col));
     col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
 
-    col.cx = 60;  col.pszText = L"Seq";    ListView_InsertColumnW(g.hList, 0, &col);
-    col.cx = 50;  col.pszText = L"Side";   ListView_InsertColumnW(g.hList, 1, &col);
-    col.cx = 180; col.pszText = L"Target"; ListView_InsertColumnW(g.hList, 2, &col);
-    col.cx = 80;  col.pszText = L"Port";    ListView_InsertColumnW(g.hList, 3, &col);
-    col.cx = 90;  col.pszText = L"RTT(ms)"; ListView_InsertColumnW(g.hList, 4, &col);
-    col.cx = 70;  col.pszText = L"Result";  ListView_InsertColumnW(g.hList, 5, &col);
+    col.cx = 60;  col.pszText = L"Seq";    ListView_InsertColumn(g.hList, 0, &col);
+    col.cx = 50;  col.pszText = L"Side";   ListView_InsertColumn(g.hList, 1, &col);
+    col.cx = 180; col.pszText = L"Target"; ListView_InsertColumn(g.hList, 2, &col);
+    col.cx = 80;  col.pszText = L"Port";   ListView_InsertColumn(g.hList, 3, &col);
+    col.cx = 90;  col.pszText = L"RTT(ms)"; ListView_InsertColumn(g.hList, 4, &col);
+    col.cx = 70;  col.pszText = L"Result"; ListView_InsertColumn(g.hList, 5, &col);
 
     if (g.hIconLarge) {
         SendMessageW(hWnd, WM_SETICON, ICON_BIG, (LPARAM)g.hIconLarge);
-        SendMessageW(hWnd, WM_SETICON, ICON_SMALL, (LPARAM)g.hIconSmall);
+        SendMessageW(hWnd, WM_SETICON, ICON_SMALL, (LPARAM)g.hIconLarge);
     }
 }
 
-static void start_test(HWND hWnd) {
+static void start_test(void) {
     if (InterlockedCompareExchange(&g.running, 1, 0) != 0) return;
     g.stopFlag = 0;
     ListView_DeleteAllItems(g.hList);
@@ -372,12 +348,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
-        case ID_BTN_START:
-            start_test(hWnd);
-            return 0;
-        case ID_BTN_STOP:
-            stop_test();
-            return 0;
+        case ID_BTN_START: start_test(); return 0;
+        case ID_BTN_STOP:  stop_test(); return 0;
         }
         return 0;
 
@@ -438,8 +410,9 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nS
     g.hIconLarge = load_icon_from_file();
     g.hIconSmall = g.hIconLarge ? (HICON)CopyIcon(g.hIconLarge) : NULL;
 
-    WNDCLASSW wc;
+    WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -448,7 +421,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nS
     wc.hIcon = g.hIconLarge;
     wc.hIconSm = g.hIconSmall;
 
-    if (!RegisterClassW(&wc)) return 1;
+    if (!RegisterClassExW(&wc)) return 1;
 
     HWND hWnd = CreateWindowExW(
         0, wc.lpszClassName, L"TCPing GUI",
