@@ -1,271 +1,438 @@
 (() => {
-  const app = document.createElement('div');
-  app.id = 'app';
-  document.body.appendChild(app);
-
-  const style = document.createElement('style');
-  style.textContent = `
-    :root {
-      --bg:#f4f7fb; --card:#fff; --line:#dbe4ef; --text:#233244; --muted:#6c7a8a;
-      --blue:#3c86ff; --orange:#ff9a3c; --green:#24a148; --red:#e55353;
-    }
-    * { box-sizing:border-box; }
-    body {
-      margin:0; font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-      background:var(--bg); color:var(--text);
-    }
-    #app { max-width:1280px; margin:0 auto; padding:12px; }
-    .topbar, .panel, .box, .tablewrap, .footerbar {
-      background:var(--card); border:1px solid var(--line); border-radius:10px;
-      box-shadow:0 2px 10px rgba(25,40,60,.04);
-    }
-    .topbar {
-      display:flex; justify-content:space-between; align-items:center;
-      padding:10px 14px; margin-bottom:10px;
-    }
-    .title { font-weight:700; font-size:15px; }
-    .sub { color:var(--muted); font-size:12px; }
-    .panel { padding:12px; margin-bottom:10px; }
-    .row {
-      display:grid; gap:10px;
-      grid-template-columns:1.4fr .7fr 1.4fr .7fr .8fr auto auto auto;
-      align-items:center;
-    }
-    input, button {
-      height:34px; border-radius:8px; border:1px solid var(--line);
-      font:inherit; font-size:13px;
-    }
-    input {
-      width:100%; padding:0 10px; background:#fff; color:var(--text);
-    }
-    button {
-      padding:0 14px; cursor:pointer; background:#fff; color:var(--text);
-    }
-    button.primary { background:#2f76f7; color:#fff; border-color:#2f76f7; }
-    button.danger { background:#e94c4c; color:#fff; border-color:#e94c4c; }
-    .tablewrap { overflow:hidden; margin-bottom:10px; }
-    table { width:100%; border-collapse:collapse; font-size:13px; }
-    thead th {
-      background:#f8fbff; text-align:left; padding:10px 8px;
-      border-bottom:1px solid var(--line); color:#516072;
-    }
-    tbody td { padding:8px; border-bottom:1px solid #edf2f7; }
-    tbody tr:hover { background:#fafcff; }
-    .barcell { width:120px; }
-    .vbar {
-      width:10px; height:22px; border-radius:6px; background:#d8e5ff;
-      display:inline-block; position:relative; overflow:hidden;
-    }
-    .vbar > i {
-      position:absolute; left:0; bottom:0; width:100%; display:block; border-radius:6px;
-    }
-    .blue > i { background:var(--blue); }
-    .orange > i { background:var(--orange); }
-    .logstatus { display:grid; grid-template-columns:1.3fr .9fr; gap:10px; }
-    .box { padding:10px; min-height:120px; }
-    .box h3 { margin:0 0 8px; font-size:13px; color:#425266; }
-    #log, #debug {
-      height:160px; overflow:auto; white-space:pre-wrap; font-size:12px; line-height:1.5;
-      background:#fff; border:1px solid #e5eaf2; border-radius:8px; padding:8px; color:#334155;
-    }
-    .footerbar {
-      margin-top:10px; padding:8px 12px; color:#5d6d80; font-size:12px;
-      display:flex; gap:16px; flex-wrap:wrap;
-    }
-    .dot {
-      display:inline-block; width:8px; height:8px; border-radius:50%;
-      background:#aaa; margin-right:6px;
-    }
-    .on { background:var(--green); }
-    .off { background:var(--red); }
-    @media (max-width:1100px) {
-      .row { grid-template-columns:1fr 1fr; }
-      .logstatus { grid-template-columns:1fr; }
-      .barcell { width:auto; }
-    }
-  `;
-  document.head.appendChild(style);
-
-  app.innerHTML = `
-    <div class="topbar">
-      <div>
-        <div class="title">TCPing</div>
-        <div class="sub">Dual target TCP latency test</div>
-      </div>
-      <div class="sub" id="topState">Ready</div>
-    </div>
-
-    <div class="panel">
-      <div class="row">
-        <input id="aHost" placeholder="Target A">
-        <input id="aPort" placeholder="Port A" value="80">
-        <input id="bHost" placeholder="Target B">
-        <input id="bPort" placeholder="Port B" value="80">
-        <input id="duration" placeholder="Duration" value="60">
-        <button class="primary" id="startBtn">Start</button>
-        <button class="danger" id="stopBtn">Stop</button>
-        <button id="refreshBtn">Refresh</button>
-      </div>
-    </div>
-
-    <div class="tablewrap">
-      <table>
-        <thead>
-          <tr>
-            <th style="width:170px">Time</th>
-            <th style="width:90px">A</th>
-            <th style="width:90px">B</th>
-            <th style="width:140px">A Bar</th>
-            <th style="width:140px">B Bar</th>
-            <th>Note</th>
-          </tr>
-        </thead>
-        <tbody id="tbody"></tbody>
-      </table>
-    </div>
-
-    <div class="logstatus">
-      <div class="box">
-        <h3>Log</h3>
-        <div id="log"></div>
-      </div>
-      <div class="box">
-        <h3>Debug</h3>
-        <div id="debug"></div>
-      </div>
-    </div>
-
-    <div class="footerbar">
-      <span><i class="dot off" id="runDot"></i><span id="runText">Stopped</span></span>
-      <span id="runningVal">No</span>
-      <span id="aStats">A stats: -</span>
-      <span id="bStats">B stats: -</span>
-      <span id="lastLog">Last log: -</span>
-    </div>
-  `;
-
   const $ = (id) => document.getElementById(id);
-  const tbody = $('tbody');
-  const logBox = $('log');
-  const debugBox = $('debug');
 
-  function txt(v) {
-    return v === null || v === undefined ? '' : String(v);
+  const state = {
+    running: false,
+    timer: null,
+    rows: [],
+    lastLog: "-",
+    statsA: { sent: 0, ok: 0, fail: 0, min: null, max: null, avg: null },
+    statsB: { sent: 0, ok: 0, fail: 0, min: null, max: null, avg: null }
+  };
+
+  function esc(s) {
+    return String(s ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
   }
 
-  function bool(v) {
-    if (typeof v === 'boolean') return v;
-    if (typeof v === 'number') return v !== 0;
-    if (typeof v === 'string') return ['1','true','yes','running','on'].includes(v.trim().toLowerCase());
-    return false;
+  function nowTime() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, "0");
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
   }
 
-  function pick(o, keys, def = '') {
-    if (!o || typeof o !== 'object') return def;
-    for (const k of keys) if (o[k] !== undefined && o[k] !== null) return o[k];
-    return def;
+  function barClass(ms) {
+    if (ms == null || !isFinite(ms)) return "bar null";
+    if (ms < 50) return "bar good";
+    if (ms < 150) return "bar mid";
+    return "bar bad";
   }
 
-  function bar(v, cls) {
-    const n = Number(v);
-    const h = (!isFinite(n) || n < 0) ? 0 : Math.max(10, Math.min(100, Math.round(100 - n)));
-    return `<span class="vbar ${cls}"><i style="height:${h}%"></i></span>`;
+  function barHeight(ms) {
+    if (ms == null || !isFinite(ms)) return 8;
+    const h = Math.max(8, Math.min(120, 8 + ms * 0.8));
+    return Math.round(h);
   }
 
-  function addRow(r) {
-    const a = pick(r, ['a','A','lat_a','ms_a','latency_a'], '');
-    const b = pick(r, ['b','B','lat_b','ms_b','latency_b'], '');
-    const t = pick(r, ['time','t','ts'], '');
-    const n = pick(r, ['note','msg','message','status'], '');
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${txt(t)}</td>
-      <td>${txt(a)}</td>
-      <td>${txt(b)}</td>
-      <td class="barcell">${bar(a, 'blue')}</td>
-      <td class="barcell">${bar(b, 'orange')}</td>
-      <td>${txt(n)}</td>
-    `;
-    tbody.prepend(tr);
+  function fmtMs(v) {
+    if (v == null || !isFinite(v)) return "Timeout";
+    return `${v.toFixed(1)} ms`;
   }
 
-  function setLines(el, v) {
-    if (Array.isArray(v)) el.textContent = v.map(txt).join('\n');
-    else if (typeof v === 'string') el.textContent = v;
-    else el.textContent = '';
-    el.scrollTop = el.scrollHeight;
+  function avgFromRow(v) {
+    if (!v || !v.length) return null;
+    const sum = v.reduce((a, b) => a + b, 0);
+    return sum / v.length;
   }
 
-  async function api(path, body) {
-    const opt = body ? {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify(body)
-    } : {};
-    const r = await fetch(path, opt);
-    const s = await r.text();
-    try { return JSON.parse(s); } catch { return { raw:s }; }
+  function recomputeStats() {
+    const aOk = state.rows.map(r => r.a).filter(v => v != null && isFinite(v));
+    const bOk = state.rows.map(r => r.b).filter(v => v != null && isFinite(v));
+
+    const aAll = state.rows.length;
+    const bAll = state.rows.length;
+
+    state.statsA.sent = aAll;
+    state.statsB.sent = bAll;
+    state.statsA.ok = aOk.length;
+    state.statsB.ok = bOk.length;
+    state.statsA.fail = aAll - aOk.length;
+    state.statsB.fail = bAll - bOk.length;
+    state.statsA.min = aOk.length ? Math.min(...aOk) : null;
+    state.statsB.min = bOk.length ? Math.min(...bOk) : null;
+    state.statsA.max = aOk.length ? Math.max(...aOk) : null;
+    state.statsB.max = bOk.length ? Math.max(...bOk) : null;
+    state.statsA.avg = avgFromRow(aOk);
+    state.statsB.avg = avgFromRow(bOk);
   }
 
-  function applyStatus(s) {
-    const running = bool(pick(s, ['running','is_running','started','active'], false));
-    $('runningVal').textContent = running ? 'Yes' : 'No';
-    $('runDot').className = 'dot ' + (running ? 'on' : 'off');
-    $('runText').textContent = running ? 'Running' : 'Stopped';
+  function renderTable() {
+    const tb = $("resultsBody");
+    if (!tb) return;
 
-    $('aStats').textContent = 'A stats: ' + txt(pick(s, ['a_stats','stats_a','a_summary'], '-'));
-    $('bStats').textContent = 'B stats: ' + txt(pick(s, ['b_stats','stats_b','b_summary'], '-'));
-    $('lastLog').textContent = 'Last log: ' + txt(pick(s, ['last_log','lastLog','latest_log','last'], '-'));
+    tb.innerHTML = state.rows.map((r) => {
+      const aH = barHeight(r.a);
+      const bH = barHeight(r.b);
+      return `
+        <tr>
+          <td class="time">${esc(r.time)}</td>
+          <td class="num">${esc(fmtMs(r.a))}</td>
+          <td class="num">${esc(fmtMs(r.b))}</td>
+          <td class="barcell">
+            <div class="${barClass(r.a)}" style="height:${aH}px"></div>
+          </td>
+          <td class="barcell">
+            <div class="${barClass(r.b)}" style="height:${bH}px"></div>
+          </td>
+          <td class="note">${esc(r.note || "")}</td>
+        </tr>
+      `;
+    }).join("");
 
-    const logs = pick(s, ['logs','log','op_logs','operational_logs'], null);
-    const dbg = pick(s, ['debug','dbg','debug_logs','dbg_logs'], null);
-    const rows = pick(s, ['rows','results','table','data'], []);
-
-    if (logs !== null) setLines(logBox, logs);
-    if (dbg !== null) setLines(debugBox, dbg);
-
-    if (Array.isArray(rows)) {
-      tbody.innerHTML = '';
-      rows.slice().reverse().forEach(addRow);
-    }
+    recomputeStats();
+    renderStatus();
   }
 
-  async function refresh() {
+  function renderStatus() {
+    const a = state.statsA;
+    const b = state.statsB;
+
+    $("statusRun").textContent = state.running ? "Running" : "Stopped";
+    $("statusA").textContent = `A: ${a.ok}/${a.sent} ok`;
+    $("statusB").textContent = `B: ${b.ok}/${b.sent} ok`;
+    $("statusLast").textContent = `Last: ${state.lastLog}`;
+  }
+
+  function renderLogs(op, dbg) {
+    if (typeof op === "string") $("logOp").value = op;
+    if (typeof dbg === "string") $("logDbg").value = dbg;
+  }
+
+  async function apiGet(path) {
+    const res = await fetch(path, { cache: "no-store" });
+    if (!res.ok) throw new Error(`GET ${path} ${res.status}`);
+    return await res.json();
+  }
+
+  async function apiPost(path, data) {
+    const body = new URLSearchParams();
+    for (const [k, v] of Object.entries(data)) body.set(k, v);
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString()
+    });
+    if (!res.ok) throw new Error(`POST ${path} ${res.status}`);
+    return await res.json();
+  }
+
+  async function refreshStatus() {
     try {
-      const s = await api('/api/status');
-      applyStatus(s);
-      $('topState').textContent = 'OK';
+      const j = await apiGet("/api/status");
+      state.running = !!j.running;
+      state.lastLog = j.last_log || "-";
+
+      if (Array.isArray(j.rows)) {
+        state.rows = j.rows.map(x => ({
+          time: x.time || "",
+          a: x.a_ms != null ? Number(x.a_ms) : null,
+          b: x.b_ms != null ? Number(x.b_ms) : null,
+          note: x.note || ""
+        }));
+      }
+
+      renderTable();
+      renderLogs(j.log_op || "", j.log_dbg || "");
     } catch (e) {
-      $('topState').textContent = 'Refresh failed';
+      state.lastLog = "status error";
+      renderStatus();
     }
   }
 
-  $('startBtn').onclick = async () => {
+  async function startPing() {
+    const targetA = $("targetA").value.trim();
+    const portA = $("portA").value.trim();
+    const targetB = $("targetB").value.trim();
+    const portB = $("portB").value.trim();
+    const duration = $("duration").value.trim();
+
+    if (!targetA || !portA || !targetB || !portB) {
+      alert("Please fill Target A, Port A, Target B, Port B.");
+      return;
+    }
+
     try {
-      await api('/api/start', {
-        a_host: $('aHost').value.trim(),
-        a_port: $('aPort').value.trim(),
-        b_host: $('bHost').value.trim(),
-        b_port: $('bPort').value.trim(),
-        duration: $('duration').value.trim()
+      await apiPost("/api/start", {
+        target_a: targetA,
+        port_a: portA,
+        target_b: targetB,
+        port_b: portB,
+        duration: duration || "0"
       });
-      await refresh();
+      state.running = true;
+      state.lastLog = "started";
+      await refreshStatus();
     } catch (e) {
-      $('topState').textContent = 'Start failed';
+      alert("Start failed.");
     }
-  };
+  }
 
-  $('stopBtn').onclick = async () => {
+  async function stopPing() {
     try {
-      await api('/api/stop');
-      await refresh();
+      await apiPost("/api/stop", {});
+      state.running = false;
+      state.lastLog = "stopped";
+      await refreshStatus();
     } catch (e) {
-      $('topState').textContent = 'Stop failed';
+      alert("Stop failed.");
     }
-  };
+  }
 
-  $('refreshBtn').onclick = refresh;
+  function bindUI() {
+    $("btnStart").addEventListener("click", startPing);
+    $("btnStop").addEventListener("click", stopPing);
+    $("btnClear").addEventListener("click", () => {
+      state.rows = [];
+      renderTable();
+    });
 
-  setInterval(refresh, 1000);
-  refresh();
+    $("targetA").addEventListener("keydown", (e) => { if (e.key === "Enter") startPing(); });
+    $("portA").addEventListener("keydown", (e) => { if (e.key === "Enter") startPing(); });
+    $("targetB").addEventListener("keydown", (e) => { if (e.key === "Enter") startPing(); });
+    $("portB").addEventListener("keydown", (e) => { if (e.key === "Enter") startPing(); });
+    $("duration").addEventListener("keydown", (e) => { if (e.key === "Enter") startPing(); });
+  }
+
+  function injectStyle() {
+    const css = document.createElement("style");
+    css.textContent = `
+      :root{
+        --bg:#f4f7fb;
+        --panel:#ffffff;
+        --line:#d9e1ea;
+        --text:#1f2a37;
+        --muted:#667085;
+        --blue:#2f80ed;
+        --orange:#f2994a;
+        --good:#e8f3ff;
+        --bad:#fff1e6;
+        --shadow:0 4px 18px rgba(18,28,45,.08);
+      }
+      *{box-sizing:border-box}
+      body{
+        margin:0;
+        font-family:Segoe UI, Arial, sans-serif;
+        background:var(--bg);
+        color:var(--text);
+        font-size:13px;
+      }
+      .wrap{
+        max-width:1180px;
+        margin:0 auto;
+        padding:14px;
+      }
+      .topbar,.panel,.statusbar{
+        background:var(--panel);
+        border:1px solid var(--line);
+        border-radius:10px;
+        box-shadow:var(--shadow);
+      }
+      .topbar{
+        padding:12px;
+        margin-bottom:12px;
+      }
+      .row{
+        display:flex;
+        gap:10px;
+        flex-wrap:wrap;
+        align-items:end;
+      }
+      .field{
+        display:flex;
+        flex-direction:column;
+        gap:5px;
+        min-width:140px;
+      }
+      .field.small{min-width:92px; width:92px;}
+      label{color:var(--muted); font-size:12px}
+      input{
+        height:32px;
+        padding:0 10px;
+        border:1px solid var(--line);
+        border-radius:8px;
+        outline:none;
+        background:#fff;
+      }
+      input:focus{border-color:#9ec5ff; box-shadow:0 0 0 3px rgba(47,128,237,.12);}
+      button{
+        height:32px;
+        padding:0 14px;
+        border:1px solid var(--line);
+        border-radius:8px;
+        background:#fff;
+        cursor:pointer;
+      }
+      button.primary{background:#eaf2ff; border-color:#b8d3ff;}
+      button.danger{background:#fff0f0; border-color:#ffcbcb;}
+      .grid{
+        display:grid;
+        grid-template-columns: 1fr;
+        gap:12px;
+      }
+      .panel{padding:10px 12px;}
+      .title{
+        font-weight:600;
+        margin:0 0 8px 0;
+        font-size:13px;
+      }
+      table{
+        width:100%;
+        border-collapse:collapse;
+        font-size:12px;
+      }
+      thead th{
+        text-align:left;
+        padding:8px 6px;
+        border-bottom:1px solid var(--line);
+        color:#506070;
+        font-weight:600;
+      }
+      tbody td{
+        padding:7px 6px;
+        border-bottom:1px solid #eef2f7;
+        vertical-align:middle;
+      }
+      .num{width:110px; white-space:nowrap;}
+      .time{width:92px; white-space:nowrap;}
+      .barcell{width:72px; text-align:center;}
+      .bar{
+        width:18px;
+        border-radius:6px 6px 2px 2px;
+        margin:0 auto;
+        border:1px solid rgba(0,0,0,.05);
+      }
+      .bar.good{background:var(--blue);}
+      .bar.mid{background:var(--orange);}
+      .bar.bad{background:#d9534f;}
+      .bar.null{background:#cfd8e3;}
+      textarea{
+        width:100%;
+        min-height:86px;
+        resize:vertical;
+        border:1px solid var(--line);
+        border-radius:8px;
+        padding:8px;
+        background:#fbfcfe;
+        font-family:Consolas, monospace;
+        font-size:12px;
+      }
+      .two{
+        display:grid;
+        grid-template-columns:1fr 1fr;
+        gap:12px;
+      }
+      .statusbar{
+        margin-top:12px;
+        padding:10px 12px;
+        display:flex;
+        gap:16px;
+        flex-wrap:wrap;
+        color:#334155;
+      }
+      .muted{color:var(--muted);}
+      @media (max-width: 900px){
+        .two{grid-template-columns:1fr;}
+      }
+    `;
+    document.head.appendChild(css);
+  }
+
+  function injectUI() {
+    document.body.innerHTML = `
+      <div class="wrap">
+        <div class="topbar">
+          <div class="row">
+            <div class="field">
+              <label>Target A</label>
+              <input id="targetA" value="1.1.1.1" />
+            </div>
+            <div class="field small">
+              <label>Port A</label>
+              <input id="portA" value="80" />
+            </div>
+            <div class="field">
+              <label>Target B</label>
+              <input id="targetB" value="8.8.8.8" />
+            </div>
+            <div class="field small">
+              <label>Port B</label>
+              <input id="portB" value="53" />
+            </div>
+            <div class="field small">
+              <label>Duration</label>
+              <input id="duration" value="0" />
+            </div>
+            <button id="btnStart" class="primary">Start</button>
+            <button id="btnStop" class="danger">Stop</button>
+            <button id="btnClear">Clear</button>
+          </div>
+        </div>
+
+        <div class="grid">
+          <div class="panel">
+            <div class="title">Results</div>
+            <table>
+              <thead>
+                <tr>
+                  <th class="time">Time</th>
+                  <th class="num">A</th>
+                  <th class="num">B</th>
+                  <th class="barcell">A Bar</th>
+                  <th class="barcell">B Bar</th>
+                  <th>Note</th>
+                </tr>
+              </thead>
+              <tbody id="resultsBody"></tbody>
+            </table>
+          </div>
+
+          <div class="two">
+            <div class="panel">
+              <div class="title">Operational Log</div>
+              <textarea id="logOp" readonly></textarea>
+            </div>
+            <div class="panel">
+              <div class="title">Debug Log</div>
+              <textarea id="logDbg" readonly></textarea>
+            </div>
+          </div>
+        </div>
+
+        <div class="statusbar">
+          <div id="statusRun">Stopped</div>
+          <div id="statusA">A: 0/0 ok</div>
+          <div id="statusB">B: 0/0 ok</div>
+          <div id="statusLast">Last: -</div>
+        </div>
+      </div>
+    `;
+  }
+
+  async function init() {
+    injectStyle();
+    injectUI();
+    bindUI();
+    await refreshStatus();
+    state.timer = setInterval(refreshStatus, 1000);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
 })();
