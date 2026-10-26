@@ -5,30 +5,29 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <commctrl.h>
 #include <process.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
 
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "shell32.lib")
-
 #define APP_CLASS L"TCPingGUIClass"
 #define APP_TITLE L"TCPing GUI"
 #define ID_TRAYICON 1001
 #define WM_TRAYICON (WM_APP + 1)
 
-#define MAX_LOG 32768
-#define MAX_RESULT 512
 #define SERVER_PORT_BASE 38000
 #define SERVER_PORT_MAX 38099
 
+#define MAX_LOG 32768
+#define MAX_ROWS 64
+
 static HWND g_hwnd = NULL;
-static HWND g_editAHost, g_editAPort, g_editBHost, g_editBPort, g_editDur;
-static HWND g_btnStart, g_btnStop, g_btnShow, g_status;
-static HWND g_list;
-static HWND g_logOp, g_logDbg;
+static HWND g_editAHost = NULL, g_editAPort = NULL, g_editBHost = NULL, g_editBPort = NULL, g_editDur = NULL;
+static HWND g_btnStart = NULL, g_btnStop = NULL, g_btnShow = NULL, g_status = NULL;
+static HWND g_list = NULL;
+static HWND g_hLogOp = NULL, g_hLogDbg = NULL;
 
 static HANDLE g_server_thread = NULL;
 static HANDLE g_ping_thread = NULL;
@@ -40,27 +39,18 @@ static UINT g_server_port = 0;
 static CRITICAL_SECTION g_log_cs;
 static CRITICAL_SECTION g_data_cs;
 
-static wchar_t g_log_op[MAX_LOG];
-static wchar_t g_log_dbg[MAX_LOG];
+static wchar_t g_log_op[MAX_LOG] = L"";
+static wchar_t g_log_dbg[MAX_LOG] = L"";
 
-static wchar_t g_a_host[128] = L"";
-static wchar_t g_b_host[128] = L"";
-static wchar_t g_a_port[16] = L"80";
-static wchar_t g_b_port[16] = L"80";
+static wchar_t g_a_host[128] = L"8.8.8.8";
+static wchar_t g_b_host[128] = L"1.1.1.1";
+static wchar_t g_a_port[16] = L"53";
+static wchar_t g_b_port[16] = L"53";
 static int g_duration = 30;
 
 static long long g_a_ok = 0, g_a_fail = 0, g_b_ok = 0, g_b_fail = 0;
 static double g_a_last = -1.0, g_b_last = -1.0;
 static wchar_t g_last_note[256] = L"Idle";
-
-typedef struct PingTask {
-    wchar_t host[128];
-    wchar_t port[16];
-    double last_ms;
-    long long ok;
-    long long fail;
-    int family;
-} PingTask;
 
 typedef struct ResultRow {
     wchar_t time[32];
@@ -71,14 +61,30 @@ typedef struct ResultRow {
     wchar_t note[128];
 } ResultRow;
 
-static ResultRow g_rows[64];
+static ResultRow g_rows[MAX_ROWS];
 static int g_row_count = 0;
 
-static void AppendText(HWND h, const wchar_t* text) {
-    int len = GetWindowTextLengthW(h);
-    SendMessageW(h, EM_SETSEL, (WPARAM)len, (LPARAM)len);
-    SendMessageW(h, EM_REPLACESEL, 0, (LPARAM)text);
-    SendMessageW(h, EM_SCROLLCARET, 0, 0);
+static const char g_main_js[] =
+"const $=s=>document.querySelector(s);\n"
+"async function j(u,o){const r=await fetch(u,o);return await r.json();}\n"
+"function bar(v,c){const h=Math.max(4,Math.min(34,Math.round(v||0)));return `<div class='bars'><div class='bar ${c}' style='height:${h}px'></div></div>`;}\n"
+"function row(r){const tr=document.createElement('tr');\n"
+"tr.innerHTML=`<td>${r.time||''}</td><td>${r.a||''}</td><td>${r.b||''}</td><td>${bar(r.ah,'a')}</td><td>${bar(r.bh,'b')}</td><td>${r.note||''}</td>`;return tr;}\n"
+"async function refresh(){const s=await j('/api/status');\n"
+"$('#state').textContent=s.running?'Running':'Stopped';\n"
+"$('#stats').textContent=`A ${s.a.ok}/${s.a.fail} last ${s.a.last_ms} ms | B ${s.b.ok}/${s.b.fail} last ${s.b.last_ms} ms`;\n"
+"$('#lastlog').textContent=s.last_log||'';\n"
+"const tb=$('#tbody');tb.innerHTML='';(s.rows||[]).forEach(x=>tb.appendChild(row(x)));\n"
+"$('#oplog').value=s.op_log||'';$('#dbglog').value=s.dbg_log||'';}\n"
+"async function start(){const o={a:$('#a').value,ap:$('#ap').value,b:$('#b').value,bp:$('#bp').value,d:$('#d').value};await j('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});refresh();}\n"
+"async function stop(){await j('/api/stop',{method:'POST'});refresh();}\n"
+"window.onload=()=>{$('#start').onclick=start;$('#stop').onclick=stop;setInterval(refresh,1000);refresh();};\n";
+
+static void AppendToBuffer(wchar_t* dst, size_t dstsz, const wchar_t* src) {
+    size_t cur = wcslen(dst);
+    size_t add = wcslen(src);
+    if (cur + add + 1 >= dstsz) add = dstsz - cur - 1;
+    wcsncat(dst, src, add);
 }
 
 static void LogOp(const wchar_t* fmt, ...) {
@@ -94,12 +100,10 @@ static void LogOp(const wchar_t* fmt, ...) {
     swprintf(line, 1200, L"[%02d:%02d:%02d] %s\r\n", st.wHour, st.wMinute, st.wSecond, buf);
 
     EnterCriticalSection(&g_log_cs);
-    wcsncat(g_log_op, line, MAX_LOG - wcslen(g_log_op) - 1);
+    AppendToBuffer(g_log_op, MAX_LOG, line);
     LeaveCriticalSection(&g_log_cs);
 
-    if (g_log_op) {
-        SetWindowTextW(g_log_op ? g_log_op : NULL, g_log_op);
-    }
+    if (g_hLogOp) SetWindowTextW(g_hLogOp, g_log_op);
 }
 
 static void LogDbg(const wchar_t* fmt, ...) {
@@ -115,15 +119,10 @@ static void LogDbg(const wchar_t* fmt, ...) {
     swprintf(line, 1200, L"[%02d:%02d:%02d] %s\r\n", st.wHour, st.wMinute, st.wSecond, buf);
 
     EnterCriticalSection(&g_log_cs);
-    wcsncat(g_log_dbg, line, MAX_LOG - wcslen(g_log_dbg) - 1);
+    AppendToBuffer(g_log_dbg, MAX_LOG, line);
     LeaveCriticalSection(&g_log_cs);
-}
 
-static void RefreshLogs(void) {
-    EnterCriticalSection(&g_log_cs);
-    SetWindowTextW(g_log_op, g_log_op);
-    SetWindowTextW(g_log_dbg, g_log_dbg);
-    LeaveCriticalSection(&g_log_cs);
+    if (g_hLogDbg) SetWindowTextW(g_hLogDbg, g_log_dbg);
 }
 
 static void SetStatusText(void) {
@@ -135,14 +134,15 @@ static void SetStatusText(void) {
              g_b_ok, g_b_fail, g_b_last,
              g_last_note);
     LeaveCriticalSection(&g_data_cs);
-    SetWindowTextW(g_status, buf);
+    if (g_status) SetWindowTextW(g_status, buf);
 }
 
 static void AddResultRow(const wchar_t* a, const wchar_t* b, const wchar_t* abar, const wchar_t* bbar, const wchar_t* note) {
     SYSTEMTIME st;
     GetLocalTime(&st);
+
     EnterCriticalSection(&g_data_cs);
-    if (g_row_count < 64) {
+    if (g_row_count < MAX_ROWS) {
         ResultRow* r = &g_rows[g_row_count++];
         swprintf(r->time, 32, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
         wcsncpy(r->a, a, 31); r->a[31] = 0;
@@ -151,8 +151,8 @@ static void AddResultRow(const wchar_t* a, const wchar_t* b, const wchar_t* abar
         wcsncpy(r->bbar, bbar, 63); r->bbar[63] = 0;
         wcsncpy(r->note, note, 127); r->note[127] = 0;
     } else {
-        memmove(&g_rows[0], &g_rows[1], sizeof(ResultRow) * 63);
-        ResultRow* r = &g_rows[63];
+        memmove(&g_rows[0], &g_rows[1], sizeof(ResultRow) * (MAX_ROWS - 1));
+        ResultRow* r = &g_rows[MAX_ROWS - 1];
         swprintf(r->time, 32, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
         wcsncpy(r->a, a, 31); r->a[31] = 0;
         wcsncpy(r->b, b, 31); r->b[31] = 0;
@@ -164,7 +164,9 @@ static void AddResultRow(const wchar_t* a, const wchar_t* b, const wchar_t* abar
 }
 
 static void UpdateListView(void) {
+    if (!g_list) return;
     ListView_DeleteAllItems(g_list);
+
     EnterCriticalSection(&g_data_cs);
     for (int i = 0; i < g_row_count; i++) {
         LVITEMW it;
@@ -172,7 +174,10 @@ static void UpdateListView(void) {
         it.mask = LVIF_TEXT;
         it.iItem = i;
 
-        it.iSubItem = 0; it.pszText = g_rows[i].time; ListView_InsertItem(g_list, &it);
+        it.iSubItem = 0;
+        it.pszText = g_rows[i].time;
+        ListView_InsertItem(g_list, &it);
+
         ListView_SetItemText(g_list, i, 1, g_rows[i].a);
         ListView_SetItemText(g_list, i, 2, g_rows[i].b);
         ListView_SetItemText(g_list, i, 3, g_rows[i].abar);
@@ -182,58 +187,72 @@ static void UpdateListView(void) {
     LeaveCriticalSection(&g_data_cs);
 }
 
-static void SafeSetText(HWND h, const wchar_t* s) {
-    if (h) SetWindowTextW(h, s);
+static void WideToUtf8(char* out, size_t outsz, const wchar_t* in) {
+    WideCharToMultiByte(CP_UTF8, 0, in, -1, out, (int)outsz, NULL, NULL);
 }
 
 static void JsonEscapeAppend(char* dst, size_t dstsz, const wchar_t* src) {
     size_t len = strlen(dst);
     for (; *src && len + 8 < dstsz; src++) {
-        char c = (char)(*src & 0x7F);
+        unsigned ch = (unsigned)*src;
         if (*src == L'\\' || *src == L'"') {
             dst[len++] = '\\';
-            dst[len++] = c;
+            dst[len++] = (char)*src;
         } else if (*src == L'\r') {
             continue;
         } else if (*src == L'\n') {
             dst[len++] = '\\';
             dst[len++] = 'n';
-        } else if ((unsigned)*src < 0x20) {
-            len += _snprintf(dst + len, dstsz - len, "\\u%04x", (unsigned)*src);
+        } else if (ch < 0x20) {
+            len += _snprintf(dst + len, dstsz - len, "\\u%04x", ch);
         } else {
-            dst[len++] = c;
+            char tmp[8];
+            WideCharToMultiByte(CP_UTF8, 0, src, 1, tmp, sizeof(tmp), NULL, NULL);
+            dst[len++] = tmp[0];
         }
     }
     dst[len] = 0;
 }
 
-static void WideToUtf8(char* out, size_t outsz, const wchar_t* in) {
-    WideCharToMultiByte(CP_UTF8, 0, in, -1, out, (int)outsz, NULL, NULL);
+static void EscapeUtf8Json(char* dst, size_t dstsz, const char* src) {
+    size_t len = strlen(dst);
+    for (; *src && len + 8 < dstsz; src++) {
+        unsigned char c = (unsigned char)*src;
+        if (c == '\\' || c == '"') {
+            dst[len++] = '\\';
+            dst[len++] = (char)c;
+        } else if (c == '\r') {
+            continue;
+        } else if (c == '\n') {
+            dst[len++] = '\\';
+            dst[len++] = 'n';
+        } else if (c < 0x20) {
+            len += _snprintf(dst + len, dstsz - len, "\\u%04x", c);
+        } else {
+            dst[len++] = (char)c;
+        }
+    }
+    dst[len] = 0;
 }
 
-static const char* MainJsContent =
-"const $=s=>document.querySelector(s);\n"
-"async function j(u,o){const r=await fetch(u,o); return await r.json();}\n"
-"function row(r){const tr=document.createElement('tr');\n"
-"tr.innerHTML=`<td>${r.time}</td><td>${r.a}</td><td>${r.b}</td><td><div class='bar a' style='height:${r.ah||0}px'></div></td><td><div class='bar b' style='height:${r.bh||0}px'></div></td><td>${r.note}</td>`; return tr;}\n"
-"async function refresh(){const s=await j('/api/status');\n"
-"$('#state').textContent=s.running?'Running':'Stopped';\n"
-"$('#stats').textContent=`A ${s.a.ok}/${s.a.fail} last ${s.a.last_ms} ms | B ${s.b.ok}/${s.b.fail} last ${s.b.last_ms} ms`;\n"
-"$('#lastlog').textContent=s.last_log||'';\n"
-"const tb=$('#tbody'); tb.innerHTML=''; (s.rows||[]).forEach(x=>tb.appendChild(row(x)));\n"
-"$('#oplog').value=s.op_log||''; $('#dbglog').value=s.dbg_log||'';}\n"
-"async function start(){const f=new FormData($('#form')); const o={}; for(const [k,v] of f.entries()) o[k]=v; await j('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)}); refresh();}\n"
-"async function stop(){await j('/api/stop',{method:'POST'}); refresh();}\n"
-"window.onload=()=>{$('#start').onclick=start; $('#stop').onclick=stop; setInterval(refresh,1000); refresh();};\n";
-
-static char* FindHeader(char* req, const char* name) {
-    size_t n = strlen(name);
-    char* p = req;
-    while ((p = strstr(p, name)) != NULL) {
-        if ((p == req || p[-1] == '\n') && p[n] == ':') return p + n + 1;
-        p++;
+static int SendAll(SOCKET s, const char* data, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = send(s, data + sent, len - sent, 0);
+        if (n <= 0) return 0;
+        sent += n;
     }
-    return NULL;
+    return 1;
+}
+
+static void SendHttpText(SOCKET s, const char* code, const char* ctype, const char* body) {
+    char hdr[512];
+    int blen = (int)strlen(body);
+    _snprintf(hdr, sizeof(hdr),
+              "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+              code, ctype, blen);
+    SendAll(s, hdr, (int)strlen(hdr));
+    SendAll(s, body, blen);
 }
 
 static int ParseContentLength(const char* req) {
@@ -291,7 +310,10 @@ static void ExtractJsonValue(const char* body, const char* key, char* out, int o
     if (*p == '"') {
         p++;
         const char* e = p;
-        while (*e && !(*e == '"' && e[-1] != '\\')) e++;
+        while (*e) {
+            if (*e == '"' && e > p && e[-1] != '\\') break;
+            e++;
+        }
         int n = (int)(e - p);
         if (n >= outsz) n = outsz - 1;
         memcpy(out, p, n);
@@ -304,84 +326,6 @@ static void ExtractJsonValue(const char* body, const char* key, char* out, int o
         memcpy(out, p, n);
         out[n] = 0;
     }
-}
-
-static int SendAll(SOCKET s, const char* data, int len) {
-    int sent = 0;
-    while (sent < len) {
-        int n = send(s, data + sent, len - sent, 0);
-        if (n <= 0) return 0;
-        sent += n;
-    }
-    return 1;
-}
-
-static void SendHttpText(SOCKET s, const char* code, const char* ctype, const char* body) {
-    char hdr[512];
-    int blen = (int)strlen(body);
-    _snprintf(hdr, sizeof(hdr),
-              "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
-              code, ctype, blen);
-    SendAll(s, hdr, (int)strlen(hdr));
-    SendAll(s, body, blen);
-}
-
-static void BuildStatusJson(char* out, size_t outsz) {
-    char op[MAX_LOG * 2] = {0}, dbg[MAX_LOG * 2] = {0}, last[512] = {0};
-    char ahost[256], bhost[256], note[512];
-    WideToUtf8(ahost, sizeof(ahost), g_a_host);
-    WideToUtf8(bhost, sizeof(bhost), g_b_host);
-    WideToUtf8(note, sizeof(note), g_last_note);
-
-    EnterCriticalSection(&g_log_cs);
-    WideToUtf8(op, sizeof(op), g_log_op);
-    WideToUtf8(dbg, sizeof(dbg), g_log_dbg);
-    LeaveCriticalSection(&g_log_cs);
-
-    EnterCriticalSection(&g_data_cs);
-    int n = _snprintf(out, outsz,
-        "{"
-        "\"running\":%s,"
-        "\"server_port\":%u,"
-        "\"a\":{\"host\":\"%s\",\"port\":\"%s\",\"ok\":%lld,\"fail\":%lld,\"last_ms\":%.1f},"
-        "\"b\":{\"host\":\"%s\",\"port\":\"%s\",\"ok\":%lld,\"fail\":%lld,\"last_ms\":%.1f},"
-        "\"last_log\":\"",
-        g_running ? "true" : "false", g_server_port,
-        ahost, g_a_port, g_a_ok, g_a_fail, g_a_last,
-        bhost, g_b_port, g_b_ok, g_b_fail, g_b_last);
-    if (n < 0) n = 0;
-    char* p = out + n;
-    JsonEscapeAppend(p, outsz - (size_t)(p - out), note);
-    p = out + strlen(out);
-    _snprintf(p, outsz - (size_t)(p - out), "\",\"rows\":[");
-    for (int i = 0; i < g_row_count; i++) {
-        char t[128], aa[128], bb[128], ab[256], bb2[256], no[256];
-        WideToUtf8(t, sizeof(t), g_rows[i].time);
-        WideToUtf8(aa, sizeof(aa), g_rows[i].a);
-        WideToUtf8(bb, sizeof(bb), g_rows[i].b);
-        WideToUtf8(ab, sizeof(ab), g_rows[i].abar);
-        WideToUtf8(bb2, sizeof(bb2), g_rows[i].bbar);
-        WideToUtf8(no, sizeof(no), g_rows[i].note);
-        char row[1024];
-        _snprintf(row, sizeof(row), "%s{\"time\":\"%s\",\"a\":\"%s\",\"b\":\"%s\",\"abar\":\"%s\",\"bbar\":\"%s\",\"note\":\"%s\",\"ah\":%d,\"bh\":%d}",
-                  i ? "," : "", t, aa, bb, ab, bb2, no,
-                  (int)((g_a_last < 0 ? 0 : g_a_last) > 200 ? 200 : (g_a_last < 0 ? 0 : g_a_last)),
-                  (int)((g_b_last < 0 ? 0 : g_b_last) > 200 ? 200 : (g_b_last < 0 ? 0 : g_b_last)));
-        strncat(out, row, outsz - strlen(out) - 1);
-    }
-    strncat(out, "],\"op_log\":\"", outsz - strlen(out) - 1);
-    JsonEscapeAppend(out, outsz, L""); /* no-op to satisfy structure */
-    char tmp[64];
-    tmp[0] = 0;
-    char* tail = out + strlen(out);
-    JsonEscapeAppend(tail, outsz - (size_t)(tail - out), L"");
-    strncat(out, op, outsz - strlen(out) - 1);
-    tail = out + strlen(out);
-    JsonEscapeAppend(tail, outsz - (size_t)(tail - out), L"");
-    strncat(out, "\",\"dbg_log\":\"", outsz - strlen(out) - 1);
-    strncat(out, dbg, outsz - strlen(out) - 1);
-    strncat(out, "\"}", outsz - strlen(out) - 1);
-    LeaveCriticalSection(&g_data_cs);
 }
 
 static int TcpPingOne(const wchar_t* host, const wchar_t* port, double* ms_out) {
@@ -430,6 +374,7 @@ static int TcpPingOne(const wchar_t* host, const wchar_t* port, double* ms_out) 
 static unsigned __stdcall PingThread(void* arg) {
     (void)arg;
     LogOp(L"Ping started");
+
     while (!g_should_stop) {
         wchar_t a_ms[32] = L"timeout";
         wchar_t b_ms[32] = L"timeout";
@@ -448,7 +393,7 @@ static unsigned __stdcall PingThread(void* arg) {
 
         if (aok && bok) {
             swprintf(note, 128, L"Δ %.1f ms", am - bm);
-            wcsncpy(g_last_note, note, 255);
+            wcscpy(g_last_note, note);
         } else if (!aok && !bok) {
             wcscpy(g_last_note, L"Both timeout");
         } else if (!aok) {
@@ -458,10 +403,7 @@ static unsigned __stdcall PingThread(void* arg) {
         }
         LeaveCriticalSection(&g_data_cs);
 
-        AddResultRow(a_ms, b_ms,
-                     (aok ? L"|" : L""),
-                     (bok ? L"|" : L""),
-                     note[0] ? note : L"");
+        AddResultRow(a_ms, b_ms, aok ? L"|" : L"", bok ? L"|" : L"", note);
         UpdateListView();
         SetStatusText();
 
@@ -473,6 +415,71 @@ static unsigned __stdcall PingThread(void* arg) {
     return 0;
 }
 
+static void BuildStatusJson(char* out, size_t outsz) {
+    char op[MAX_LOG * 2] = {0};
+    char dbg[MAX_LOG * 2] = {0};
+    char note[512] = {0};
+    char ahost[256], bhost[256], aport[32], bport[32];
+
+    WideToUtf8(ahost, sizeof(ahost), g_a_host);
+    WideToUtf8(bhost, sizeof(bhost), g_b_host);
+    WideToUtf8(aport, sizeof(aport), g_a_port);
+    WideToUtf8(bport, sizeof(bport), g_b_port);
+
+    EnterCriticalSection(&g_log_cs);
+    WideToUtf8(op, sizeof(op), g_log_op);
+    WideToUtf8(dbg, sizeof(dbg), g_log_dbg);
+    LeaveCriticalSection(&g_log_cs);
+
+    EnterCriticalSection(&g_data_cs);
+    WideToUtf8(note, sizeof(note), g_last_note);
+
+    _snprintf(out, outsz,
+        "{"
+        "\"running\":%s,"
+        "\"server_port\":%u,"
+        "\"a\":{\"host\":\"%s\",\"port\":\"%s\",\"ok\":%lld,\"fail\":%lld,\"last_ms\":%.1f},"
+        "\"b\":{\"host\":\"%s\",\"port\":\"%s\",\"ok\":%lld,\"fail\":%lld,\"last_ms\":%.1f},"
+        "\"last_log\":\"",
+        g_running ? "true" : "false", g_server_port,
+        ahost, aport, g_a_ok, g_a_fail, g_a_last,
+        bhost, bport, g_b_ok, g_b_fail, g_b_last);
+
+    JsonEscapeAppend(out, outsz, L"");
+    {
+        char* p = out + strlen(out);
+        EscapeUtf8Json(p, outsz - (size_t)(p - out), note);
+    }
+    strncat(out, "\",\"rows\":[", outsz - strlen(out) - 1);
+
+    for (int i = 0; i < g_row_count; i++) {
+        char t[64], aa[64], bb[64], ab[128], bb2[128], no[128];
+        WideToUtf8(t, sizeof(t), g_rows[i].time);
+        WideToUtf8(aa, sizeof(aa), g_rows[i].a);
+        WideToUtf8(bb, sizeof(bb), g_rows[i].b);
+        WideToUtf8(ab, sizeof(ab), g_rows[i].abar);
+        WideToUtf8(bb2, sizeof(bb2), g_rows[i].bbar);
+        WideToUtf8(no, sizeof(no), g_rows[i].note);
+
+        char row[1024];
+        _snprintf(row, sizeof(row),
+            "%s{\"time\":\"%s\",\"a\":\"%s\",\"b\":\"%s\",\"abar\":\"%s\",\"bbar\":\"%s\",\"note\":\"%s\",\"ah\":%d,\"bh\":%d}",
+            i ? "," : "", t, aa, bb, ab, bb2, no,
+            (int)((g_a_last < 0 ? 0 : g_a_last) > 34 ? 34 : (g_a_last < 0 ? 0 : g_a_last)),
+            (int)((g_b_last < 0 ? 0 : g_b_last) > 34 ? 34 : (g_b_last < 0 ? 0 : g_b_last)));
+
+        strncat(out, row, outsz - strlen(out) - 1);
+    }
+
+    strncat(out, "],\"op_log\":\"", outsz - strlen(out) - 1);
+    strncat(out, op, outsz - strlen(out) - 1);
+    strncat(out, "\",\"dbg_log\":\"", outsz - strlen(out) - 1);
+    strncat(out, dbg, outsz - strlen(out) - 1);
+    strncat(out, "\"}", outsz - strlen(out) - 1);
+
+    LeaveCriticalSection(&g_data_cs);
+}
+
 static int HandleRequest(SOCKET s, char* req) {
     char method[8] = {0}, path[256] = {0};
     sscanf(req, "%7s %255s", method, path);
@@ -482,13 +489,13 @@ static int HandleRequest(SOCKET s, char* req) {
 "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
 "<title>TCPing GUI</title><style>"
 "body{font-family:Segoe UI,Arial,sans-serif;background:#f5f7fb;color:#1f2937;margin:12px}"
-".row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}"
+".row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:end}"
 "input,button,textarea{font:13px Segoe UI,Arial;padding:6px 8px;border:1px solid #cfd8e3;border-radius:6px;background:#fff}"
 "button{background:#e9eef8;cursor:pointer}"
 "button:hover{background:#dfe8f8}"
 "table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #d8e0ea}"
 "th,td{font-size:12px;border-bottom:1px solid #edf1f5;padding:5px 6px;text-align:left;vertical-align:bottom}"
-".bars{display:flex;gap:10px;align-items:flex-end;height:34px}"
+".bars{height:34px;display:flex;align-items:flex-end}"
 ".bar{width:12px;border-radius:4px 4px 0 0;opacity:.9}"
 ".a{background:#2b7cff}.b{background:#ff9800}"
 ".panel{background:#fff;border:1px solid #d8e0ea;border-radius:8px;padding:8px;margin-top:8px}"
@@ -496,12 +503,14 @@ static int HandleRequest(SOCKET s, char* req) {
 "textarea{width:100%;height:120px;resize:vertical;white-space:pre;font-family:Consolas,monospace}"
 "label{font-size:12px;color:#4b5563}"
 "</style></head><body>"
-"<div class='row'><label>Target A<br><input id='a' name='a' value='8.8.8.8'></label>"
-"<label>Port A<br><input id='ap' name='ap' value='53' style='width:80px'></label>"
-"<label>Target B<br><input id='b' name='b' value='1.1.1.1'></label>"
-"<label>Port B<br><input id='bp' name='bp' value='53' style='width:80px'></label>"
-"<label>Duration<br><input id='d' name='d' value='30' style='width:80px'></label>"
-"<div style='display:flex;align-items:end;gap:8px'><button id='start'>Start</button><button id='stop'>Stop</button></div></div>"
+"<div class='row'>"
+"<label>Target A<br><input id='a' value='8.8.8.8'></label>"
+"<label>Port A<br><input id='ap' value='53' style='width:80px'></label>"
+"<label>Target B<br><input id='b' value='1.1.1.1'></label>"
+"<label>Port B<br><input id='bp' value='53' style='width:80px'></label>"
+"<label>Duration<br><input id='d' value='30' style='width:80px'></label>"
+"<button id='start'>Start</button><button id='stop'>Stop</button>"
+"</div>"
 "<div class='status'><span id='state'>Stopped</span> | <span id='stats'></span> | <span id='lastlog'></span></div>"
 "<div class='panel'><table><thead><tr><th>Time</th><th>A</th><th>B</th><th>A Bar</th><th>B Bar</th><th>Note</th></tr></thead><tbody id='tbody'></tbody></table></div>"
 "<div class='panel'><div style='font-size:12px;margin-bottom:4px'>Operational Log</div><textarea id='oplog' readonly></textarea></div>"
@@ -512,42 +521,42 @@ static int HandleRequest(SOCKET s, char* req) {
     }
 
     if (strcmp(method, "GET") == 0 && strcmp(path, "/main.js") == 0) {
-        SendHttpText(s, "200 OK", "application/javascript; charset=utf-8", MainJsContent);
+        SendHttpText(s, "200 OK", "application/javascript; charset=utf-8", g_main_js);
         return 1;
     }
 
     if (strcmp(method, "GET") == 0 && strcmp(path, "/api/status") == 0) {
-        char json[8192];
+        char json[16384];
         json[0] = 0;
         BuildStatusJson(json, sizeof(json));
         SendHttpText(s, "200 OK", "application/json; charset=utf-8", json);
         return 1;
     }
 
-    if (strcmp(method, "POST") == 0 && (strcmp(path, "/api/start") == 0 || strcmp(path, "/api/stop") == 0)) {
-        if (strcmp(path, "/api/stop") == 0) {
-            g_should_stop = 1;
-            if (g_ping_thread) {
-                WaitForSingleObject(g_ping_thread, INFINITE);
-                CloseHandle(g_ping_thread);
-                g_ping_thread = NULL;
-            }
-            g_running = 0;
-            LogOp(L"Stopped");
-            SetStatusText();
-            SendHttpText(s, "200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
-            return 1;
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/stop") == 0) {
+        g_should_stop = 1;
+        if (g_ping_thread) {
+            WaitForSingleObject(g_ping_thread, INFINITE);
+            CloseHandle(g_ping_thread);
+            g_ping_thread = NULL;
         }
+        g_running = 0;
+        LogOp(L"Stopped");
+        SetStatusText();
+        SendHttpText(s, "200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        return 1;
+    }
 
-        int content_len = ParseContentLength(req);
-        char* body = strstr(req, "\r\n\r\n");
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/api/start") == 0) {
+        char *body = strstr(req, "\r\n\r\n");
         if (!body) {
             SendHttpText(s, "400 Bad Request", "application/json; charset=utf-8", "{\"ok\":false}");
             return 1;
         }
         body += 4;
 
-        char a[128]={0}, ap[16]={0}, b[128]={0}, bp[16]={0}, d[16]={0};
+        char a[128] = {0}, ap[16] = {0}, b[128] = {0}, bp[16] = {0}, d[16] = {0};
+
         if (strstr(req, "application/json")) {
             ExtractJsonValue(body, "a", a, sizeof(a));
             ExtractJsonValue(body, "ap", ap, sizeof(ap));
@@ -577,6 +586,7 @@ static int HandleRequest(SOCKET s, char* req) {
 
         g_should_stop = 0;
         g_running = 1;
+
         if (!g_ping_thread) {
             unsigned tid = 0;
             g_ping_thread = (HANDLE)_beginthreadex(NULL, 0, PingThread, NULL, 0, &tid);
@@ -596,7 +606,6 @@ static unsigned __stdcall ServerThread(void* arg) {
     (void)arg;
     char buf[8192];
     struct sockaddr_in addr;
-    SOCKET client;
 
     for (UINT p = SERVER_PORT_BASE; p <= SERVER_PORT_MAX; p++) {
         g_listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -610,10 +619,12 @@ static unsigned __stdcall ServerThread(void* arg) {
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port = htons((u_short)p);
 
-        if (bind(g_listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == 0 && listen(g_listen_sock, 8) == 0) {
+        if (bind(g_listen_sock, (struct sockaddr*)&addr, sizeof(addr)) == 0 &&
+            listen(g_listen_sock, 8) == 0) {
             g_server_port = p;
             break;
         }
+
         closesocket(g_listen_sock);
         g_listen_sock = INVALID_SOCKET;
     }
@@ -625,7 +636,6 @@ static unsigned __stdcall ServerThread(void* arg) {
 
     LogOp(L"Server listening on 127.0.0.1:%u", g_server_port);
     SetStatusText();
-
     ShellExecuteW(NULL, L"open", L"http://127.0.0.1:38000", NULL, NULL, SW_SHOWNORMAL);
 
     while (!g_should_stop) {
@@ -635,9 +645,10 @@ static unsigned __stdcall ServerThread(void* arg) {
         FD_SET(g_listen_sock, &rfds);
         tv.tv_sec = 1;
         tv.tv_usec = 0;
+
         int sel = select(0, &rfds, NULL, NULL, &tv);
         if (sel > 0 && FD_ISSET(g_listen_sock, &rfds)) {
-            client = accept(g_listen_sock, NULL, NULL);
+            SOCKET client = accept(g_listen_sock, NULL, NULL);
             if (client != INVALID_SOCKET) {
                 int n = recv(client, buf, sizeof(buf) - 1, 0);
                 if (n > 0) {
@@ -653,6 +664,7 @@ static unsigned __stdcall ServerThread(void* arg) {
         closesocket(g_listen_sock);
         g_listen_sock = INVALID_SOCKET;
     }
+
     LogOp(L"Server stopped");
     return 0;
 }
@@ -684,57 +696,56 @@ static void ShowMainWindow(HWND hwnd) {
     SetForegroundWindow(hwnd);
 }
 
-static void StartServerAndUi(void) {
-    if (!g_server_thread) {
-        unsigned tid = 0;
-        g_server_thread = (HANDLE)_beginthreadex(NULL, 0, ServerThread, NULL, 0, &tid);
-    }
-}
-
-static void StopAll(void) {
+static void StopPingThread(void) {
     g_should_stop = 1;
     if (g_ping_thread) {
         WaitForSingleObject(g_ping_thread, INFINITE);
         CloseHandle(g_ping_thread);
         g_ping_thread = NULL;
     }
+    g_running = 0;
+    SetStatusText();
+}
+
+static void StopAll(void) {
+    g_should_stop = 1;
+    StopPingThread();
     if (g_server_thread) {
         WaitForSingleObject(g_server_thread, INFINITE);
         CloseHandle(g_server_thread);
         g_server_thread = NULL;
     }
-    g_running = 0;
 }
 
 static void CreateControls(HWND hwnd) {
-    g_editAHost = CreateWindowW(L"EDIT", L"8.8.8.8", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 10, 10, 140, 24, hwnd, NULL, NULL, NULL);
-    g_editAPort = CreateWindowW(L"EDIT", L"53", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 160, 10, 60, 24, hwnd, NULL, NULL, NULL);
-    g_editBHost = CreateWindowW(L"EDIT", L"1.1.1.1", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 230, 10, 140, 24, hwnd, NULL, NULL, NULL);
-    g_editBPort = CreateWindowW(L"EDIT", L"53", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 380, 10, 60, 24, hwnd, NULL, NULL, NULL);
-    g_editDur   = CreateWindowW(L"EDIT", L"30", WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL, 450, 10, 60, 24, hwnd, NULL, NULL, NULL);
+    g_editAHost = CreateWindowW(L"EDIT", g_a_host, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 10, 10, 140, 24, hwnd, NULL, NULL, NULL);
+    g_editAPort = CreateWindowW(L"EDIT", g_a_port, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 160, 10, 60, 24, hwnd, NULL, NULL, NULL);
+    g_editBHost = CreateWindowW(L"EDIT", g_b_host, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 230, 10, 140, 24, hwnd, NULL, NULL, NULL);
+    g_editBPort = CreateWindowW(L"EDIT", g_b_port, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 380, 10, 60, 24, hwnd, NULL, NULL, NULL);
+    g_editDur = CreateWindowW(L"EDIT", L"30", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 450, 10, 60, 24, hwnd, NULL, NULL, NULL);
 
-    g_btnStart = CreateWindowW(L"BUTTON", L"Start", WS_CHILD|WS_VISIBLE, 520, 10, 70, 24, hwnd, (HMENU)1, NULL, NULL);
-    g_btnStop  = CreateWindowW(L"BUTTON", L"Stop",  WS_CHILD|WS_VISIBLE, 595, 10, 70, 24, hwnd, (HMENU)2, NULL, NULL);
-    g_btnShow  = CreateWindowW(L"BUTTON", L"Show",  WS_CHILD|WS_VISIBLE, 670, 10, 70, 24, hwnd, (HMENU)3, NULL, NULL);
+    g_btnStart = CreateWindowW(L"BUTTON", L"Start", WS_CHILD | WS_VISIBLE, 520, 10, 70, 24, hwnd, (HMENU)1, NULL, NULL);
+    g_btnStop = CreateWindowW(L"BUTTON", L"Stop", WS_CHILD | WS_VISIBLE, 595, 10, 70, 24, hwnd, (HMENU)2, NULL, NULL);
+    g_btnShow = CreateWindowW(L"BUTTON", L"Show", WS_CHILD | WS_VISIBLE, 670, 10, 70, 24, hwnd, (HMENU)3, NULL, NULL);
 
-    g_status = CreateWindowW(L"STATIC", L"Stopped", WS_CHILD|WS_VISIBLE, 10, 42, 760, 20, hwnd, NULL, NULL, NULL);
+    g_status = CreateWindowW(L"STATIC", L"Stopped", WS_CHILD | WS_VISIBLE, 10, 42, 760, 20, hwnd, NULL, NULL, NULL);
 
-    g_list = CreateWindowW(WC_LISTVIEWW, NULL, WS_CHILD|WS_VISIBLE|LVS_REPORT|LVS_SINGLESEL, 10, 66, 760, 200, hwnd, NULL, NULL, NULL);
-    ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT|LVS_EX_GRIDLINES);
+    g_list = CreateWindowW(WC_LISTVIEWW, NULL, WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL, 10, 66, 760, 200, hwnd, NULL, NULL, NULL);
+    ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
 
     LVCOLUMNW c;
     ZeroMemory(&c, sizeof(c));
     c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
 
-    c.pszText = L"Time"; c.cx = 80; ListView_InsertColumn(g_list, 0, &c);
+    c.pszText = L"Time"; c.cx = 80; c.iSubItem = 0; ListView_InsertColumn(g_list, 0, &c);
     c.pszText = L"A"; c.cx = 90; c.iSubItem = 1; ListView_InsertColumn(g_list, 1, &c);
     c.pszText = L"B"; c.cx = 90; c.iSubItem = 2; ListView_InsertColumn(g_list, 2, &c);
     c.pszText = L"A Bar"; c.cx = 120; c.iSubItem = 3; ListView_InsertColumn(g_list, 3, &c);
     c.pszText = L"B Bar"; c.cx = 120; c.iSubItem = 4; ListView_InsertColumn(g_list, 4, &c);
     c.pszText = L"Note"; c.cx = 250; c.iSubItem = 5; ListView_InsertColumn(g_list, 5, &c);
 
-    g_log_op = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL, 10, 275, 370, 160, hwnd, NULL, NULL, NULL);
-    g_log_dbg = CreateWindowW(L"EDIT", NULL, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY|WS_VSCROLL, 400, 275, 370, 160, hwnd, NULL, NULL, NULL);
+    g_hLogOp = CreateWindowW(L"EDIT", NULL, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL, 10, 275, 370, 160, hwnd, NULL, NULL, NULL);
+    g_hLogDbg = CreateWindowW(L"EDIT", NULL, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL, 400, 275, 370, 160, hwnd, NULL, NULL, NULL);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -742,21 +753,30 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_CREATE:
         CreateControls(hwnd);
         TrayAdd(hwnd);
-        StartServerAndUi();
+        if (!g_server_thread) {
+            unsigned tid = 0;
+            g_server_thread = (HANDLE)_beginthreadex(NULL, 0, ServerThread, NULL, 0, &tid);
+        }
         return 0;
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
-        case 1:
+        case 1: {
             GetWindowTextW(g_editAHost, g_a_host, 128);
             GetWindowTextW(g_editAPort, g_a_port, 16);
             GetWindowTextW(g_editBHost, g_b_host, 128);
             GetWindowTextW(g_editBPort, g_b_port, 16);
-            {
-                wchar_t d[16];
-                GetWindowTextW(g_editDur, d, 16);
-                g_duration = _wtoi(d);
-            }
+            wchar_t d[16];
+            GetWindowTextW(g_editDur, d, 16);
+            g_duration = _wtoi(d);
+
+            EnterCriticalSection(&g_data_cs);
+            g_a_ok = g_a_fail = g_b_ok = g_b_fail = 0;
+            g_a_last = g_b_last = -1.0;
+            wcscpy(g_last_note, L"Running");
+            g_row_count = 0;
+            LeaveCriticalSection(&g_data_cs);
+
             g_should_stop = 0;
             g_running = 1;
             if (!g_ping_thread) {
@@ -766,16 +786,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             LogOp(L"Manual start");
             SetStatusText();
             return 0;
+        }
         case 2:
-            g_should_stop = 1;
-            if (g_ping_thread) {
-                WaitForSingleObject(g_ping_thread, INFINITE);
-                CloseHandle(g_ping_thread);
-                g_ping_thread = NULL;
-            }
-            g_running = 0;
+            StopPingThread();
             LogOp(L"Manual stop");
-            SetStatusText();
             return 0;
         case 3:
             ShowMainWindow(hwnd);
@@ -814,7 +828,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show) {
-    (void)hPrev; (void)cmd; (void)show;
+    (void)hPrev;
+    (void)cmd;
+    (void)show;
+
     InitializeCriticalSection(&g_log_cs);
     InitializeCriticalSection(&g_data_cs);
 
@@ -835,12 +852,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show) {
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     RegisterClassW(&wc);
 
-    HWND hwnd = CreateWindowW(APP_CLASS, APP_TITLE, WS_OVERLAPPEDWINDOW,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 800, 480,
-                              NULL, NULL, hInst, NULL);
-    g_hwnd = hwnd;
-    ShowWindow(hwnd, SW_SHOW);
-    UpdateWindow(hwnd);
+    g_hwnd = CreateWindowW(APP_CLASS, APP_TITLE, WS_OVERLAPPEDWINDOW,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 800, 480,
+                           NULL, NULL, hInst, NULL);
+    ShowWindow(g_hwnd, SW_SHOW);
+    UpdateWindow(g_hwnd);
     SetStatusText();
 
     MSG msg;
