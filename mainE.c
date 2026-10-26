@@ -1,276 +1,335 @@
-#define _CRT_SECURE_NO_WARNINGS
-
+// mainE.c
+#define UNICODE
+#define _UNICODE
 #include <windows.h>
 #include <commctrl.h>
 #include <stdio.h>
 
 #pragma comment(lib, "comctl32.lib")
 
-#define APP_TITLE           "TCPing GUI"
+// ====== 与 main.c 共享的消息定义 ======
+#ifndef WM_APP_LOG
+#define WM_APP_LOG (WM_APP + 1)
+#endif
 
-#define WM_APP_LOG          (WM_APP + 1)
-#define WM_APP_ROW          (WM_APP + 2)
-#define WM_APP_DONE         (WM_APP + 3)
-#define WM_APP_STATUS       (WM_APP + 4)
+#ifndef WM_APP_ROW
+#define WM_APP_ROW (WM_APP + 2)
+#endif
 
-#define IDC_EDIT_A          1001
-#define IDC_EDIT_PORTA      1002
-#define IDC_EDIT_B          1003
-#define IDC_EDIT_PORTB      1004
-#define IDC_EDIT_DURATION   1005
-#define IDC_BTN_START       1006
-#define IDC_BTN_STOP        1007
-#define IDC_BTN_WEB         1008
-#define IDC_LIST_RESULTS    1009
-#define IDC_STATUSBAR       1010
+#ifndef WM_APP_STATUS
+#define WM_APP_STATUS (WM_APP + 3)
+#endif
 
-typedef struct {
-    char hostA[256];
-    int portA;
-    char hostB[256];
-    int portB;
-    int durationSec;
-    volatile LONG stopFlag;
-    HANDLE hThread;
-} APPSTATE;
+#ifndef WM_APP_DONE
+#define WM_APP_DONE (WM_APP + 4)
+#endif
 
-typedef struct {
-    char timeText[32];
-    char aText[32];
-    char bText[32];
-    char diffText[32];
-    int aMs;
-    int bMs;
-    int diffMs;
-} RESULTROW;
+// ====== 由 main.c 提供的外部函数/变量 ======
+extern void StartTcping(HWND hwnd);
+extern void StopTcping(void);
+extern void OpenWebInterface(void);
 
-HINSTANCE g_hInst = NULL;
-HWND g_hWnd = NULL;
-HWND g_hList = NULL;
-HWND g_hStatus = NULL;
-HWND g_hEditA = NULL, g_hEditPortA = NULL, g_hEditB = NULL, g_hEditPortB = NULL, g_hEditDuration = NULL;
-HWND g_hBtnStart = NULL, g_hBtnStop = NULL, g_hBtnWeb = NULL;
+extern HINSTANCE g_hInst;
+extern HWND g_hwndMain;
 
-extern void StartWork(void);
-extern void StopWork(void);
+// ====== UI 控件句柄 ======
+static HWND g_hList = NULL;
+static HWND g_hLog  = NULL;
+static HWND g_hBtnStart = NULL;
+static HWND g_hBtnStop  = NULL;
+static HWND g_hBtnWeb    = NULL;
+static HWND g_hStatus    = NULL;
 
-static void SetStatusText(const char* text) {
-    if (g_hStatus) {
-        SendMessageA(g_hStatus, SB_SETTEXTA, 0, (LPARAM)(text ? text : ""));
-    }
+// ====== 列表行数据（需与 main.c 发送的数据结构对应） ======
+typedef struct TCPING_ROW {
+    int     id;
+    wchar_t target[256];
+    int     sent;
+    int     received;
+    int     lost;
+    int     last_ms;
+    int     min_ms;
+    int     avg_ms;
+    int     max_ms;
+    int     pct;           // 0~100，用于条形进度
+    wchar_t state[64];
+} TCPING_ROW;
+
+// ====== 工具函数 ======
+static void SetStatusText(const wchar_t* text)
+{
+    if (g_hStatus)
+        SendMessageW(g_hStatus, SB_SETTEXTW, 0, (LPARAM)text);
 }
 
-static void InitListView(HWND hList) {
-    ListView_SetExtendedListViewStyle(hList,
-        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+static void AppendLogText(const wchar_t* text)
+{
+    if (!g_hLog || !text) return;
 
-    LVCOLUMNA col;
+    int len = GetWindowTextLengthW(g_hLog);
+    SendMessageW(g_hLog, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+    SendMessageW(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)text);
+    SendMessageW(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)L"\r\n");
+    SendMessageW(g_hLog, EM_SCROLLCARET, 0, 0);
+}
+
+static void InitListViewColumns(HWND hList)
+{
+    LVCOLUMNW col;
     ZeroMemory(&col, sizeof(col));
-    col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+    col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM | LVCF_FMT;
 
-    col.pszText = "Time";
-    col.cx = 110;
-    col.iSubItem = 0;
+    col.fmt = LVCFMT_LEFT;
+    col.pszText = L"目标";
+    col.cx = 170;
     ListView_InsertColumn(hList, 0, &col);
 
-    col.pszText = "A ms";
-    col.cx = 90;
-    col.iSubItem = 1;
+    col.pszText = L"发送";
+    col.cx = 60;
     ListView_InsertColumn(hList, 1, &col);
 
-    col.pszText = "B ms";
-    col.cx = 90;
-    col.iSubItem = 2;
+    col.pszText = L"接收";
+    col.cx = 60;
     ListView_InsertColumn(hList, 2, &col);
 
-    col.pszText = "Diff";
-    col.cx = 90;
-    col.iSubItem = 3;
+    col.pszText = L"丢包";
+    col.cx = 60;
     ListView_InsertColumn(hList, 3, &col);
+
+    col.pszText = L"最后";
+    col.cx = 70;
+    ListView_InsertColumn(hList, 4, &col);
+
+    col.pszText = L"最小";
+    col.cx = 70;
+    ListView_InsertColumn(hList, 5, &col);
+
+    col.pszText = L"平均";
+    col.cx = 70;
+    ListView_InsertColumn(hList, 6, &col);
+
+    col.pszText = L"最大";
+    col.cx = 70;
+    ListView_InsertColumn(hList, 7, &col);
+
+    col.pszText = L"状态";
+    col.cx = 120;
+    ListView_InsertColumn(hList, 8, &col);
 }
 
-static void ResizeControls(HWND hwnd) {
+static void UpdateListRow(const TCPING_ROW* row)
+{
+    if (!g_hList || !row) return;
+
+    LVITEMW item;
+    wchar_t buf[64];
+
+    ZeroMemory(&item, sizeof(item));
+    item.mask = LVIF_TEXT | LVIF_PARAM;
+    item.iItem = row->id;
+    item.iSubItem = 0;
+    item.pszText = (LPWSTR)row->target;
+    item.lParam = (LPARAM)row->id;
+
+    if (ListView_GetItemCount(g_hList) <= row->id) {
+        ListView_InsertItem(g_hList, &item);
+    } else {
+        ListView_SetItemText(g_hList, row->id, 0, (LPWSTR)row->target);
+    }
+
+    swprintf(buf, 64, L"%d", row->sent);
+    ListView_SetItemText(g_hList, row->id, 1, buf);
+
+    swprintf(buf, 64, L"%d", row->received);
+    ListView_SetItemText(g_hList, row->id, 2, buf);
+
+    swprintf(buf, 64, L"%d%%", row->lost);
+    ListView_SetItemText(g_hList, row->id, 3, buf);
+
+    swprintf(buf, 64, L"%d ms", row->last_ms);
+    ListView_SetItemText(g_hList, row->id, 4, buf);
+
+    swprintf(buf, 64, L"%d ms", row->min_ms);
+    ListView_SetItemText(g_hList, row->id, 5, buf);
+
+    swprintf(buf, 64, L"%d ms", row->avg_ms);
+    ListView_SetItemText(g_hList, row->id, 6, buf);
+
+    swprintf(buf, 64, L"%d ms", row->max_ms);
+    ListView_SetItemText(g_hList, row->id, 7, buf);
+
+    ListView_SetItemText(g_hList, row->id, 8, (LPWSTR)row->state);
+}
+
+static void LayoutControls(HWND hwnd)
+{
     RECT rc;
     GetClientRect(hwnd, &rc);
 
-    int pad = 10;
-    int top = 10;
-    int rowH = 24;
-    int statusH = 22;
-    int listTop = 80;
+    const int pad = 10;
+    const int top = 10;
+    const int btnH = 28;
+    const int btnW = 110;
+    const int statusH = 22;
+    const int logH = 140;
 
-    MoveWindow(g_hEditA,        70,  top, 140, rowH, TRUE);
-    MoveWindow(g_hEditPortA,    270, top, 60,  rowH, TRUE);
-    MoveWindow(g_hEditB,        410, top, 140, rowH, TRUE);
-    MoveWindow(g_hEditPortB,    610, top, 60,  rowH, TRUE);
-    MoveWindow(g_hEditDuration, 750, top, 50,  rowH, TRUE);
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
 
-    MoveWindow(g_hBtnStart, 10, 40, 90, 28, TRUE);
-    MoveWindow(g_hBtnStop,  110, 40, 90, 28, TRUE);
-    MoveWindow(g_hBtnWeb,   210, 40, 110, 28, TRUE);
+    MoveWindow(g_hBtnStart, pad, top, btnW, btnH, TRUE);
+    MoveWindow(g_hBtnStop,  pad + btnW + 8, top, btnW, btnH, TRUE);
+    MoveWindow(g_hBtnWeb,   pad + (btnW + 8) * 2, top, btnW + 20, btnH, TRUE);
 
-    MoveWindow(g_hList,
-        pad,
-        listTop,
-        rc.right - pad * 2,
-        rc.bottom - listTop - statusH - pad,
-        TRUE);
+    int listTop = top + btnH + 10;
+    int listH = h - listTop - logH - statusH - 24;
+    if (listH < 100) listH = 100;
 
-    SendMessage(g_hStatus, WM_SIZE, 0, 0);
+    MoveWindow(g_hList, pad, listTop, w - pad * 2, listH, TRUE);
+
+    int logTop = listTop + listH + 8;
+    MoveWindow(g_hLog, pad, logTop, w - pad * 2, logH, TRUE);
+
+    if (g_hStatus)
+        SendMessageW(g_hStatus, WM_SIZE, 0, 0);
 }
 
-static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+static HWND CreateMainControls(HWND hwnd)
+{
+    INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_WIN95_CLASSES };
+    InitCommonControlsEx(&icex);
+
+    g_hBtnStart = CreateWindowW(L"BUTTON", L"开始测试",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        0, 0, 0, 0, hwnd, (HMENU)1001, g_hInst, NULL);
+
+    g_hBtnStop = CreateWindowW(L"BUTTON", L"停止测试",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        0, 0, 0, 0, hwnd, (HMENU)1002, g_hInst, NULL);
+
+    g_hBtnWeb = CreateWindowW(L"BUTTON", L"打开网页",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        0, 0, 0, 0, hwnd, (HMENU)1003, g_hInst, NULL);
+
+    g_hList = CreateWindowW(WC_LISTVIEWW, L"",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        0, 0, 0, 0, hwnd, (HMENU)2001, g_hInst, NULL);
+
+    ListView_SetExtendedListViewStyle(g_hList,
+        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+
+    InitListViewColumns(g_hList);
+
+    g_hLog = CreateWindowW(L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
+        0, 0, 0, 0, hwnd, (HMENU)2002, g_hInst, NULL);
+
+    g_hStatus = CreateWindowExW(0, STATUSCLASSNAMEW, NULL,
+        WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+        0, 0, 0, 0, hwnd, (HMENU)2003, g_hInst, NULL);
+
+    SetStatusText(L"就绪");
+
+    return hwnd;
+}
+
+// ====== 窗口过程 ======
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
     switch (msg) {
-    case WM_CREATE: {
-        INITCOMMONCONTROLSEX icex;
-        icex.dwSize = sizeof(icex);
-        icex.dwICC = ICC_WIN95_CLASSES | ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES;
-        InitCommonControlsEx(&icex);
-
-        CreateWindowA("static", "Target A:", WS_CHILD | WS_VISIBLE,
-            10, 12, 60, 20, hwnd, NULL, g_hInst, NULL);
-
-        g_hEditA = CreateWindowA("edit", "192.168.1.1",
-            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-            70, 10, 140, 22, hwnd, (HMENU)IDC_EDIT_A, g_hInst, NULL);
-
-        CreateWindowA("static", "Port A:", WS_CHILD | WS_VISIBLE,
-            220, 12, 50, 20, hwnd, NULL, g_hInst, NULL);
-
-        g_hEditPortA = CreateWindowA("edit", "80",
-            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-            270, 10, 60, 22, hwnd, (HMENU)IDC_EDIT_PORTA, g_hInst, NULL);
-
-        CreateWindowA("static", "Target B:", WS_CHILD | WS_VISIBLE,
-            350, 12, 60, 20, hwnd, NULL, g_hInst, NULL);
-
-        g_hEditB = CreateWindowA("edit", "192.168.1.7",
-            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-            410, 10, 140, 22, hwnd, (HMENU)IDC_EDIT_B, g_hInst, NULL);
-
-        CreateWindowA("static", "Port B:", WS_CHILD | WS_VISIBLE,
-            560, 12, 50, 20, hwnd, NULL, g_hInst, NULL);
-
-        g_hEditPortB = CreateWindowA("edit", "53",
-            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-            610, 10, 60, 22, hwnd, (HMENU)IDC_EDIT_PORTB, g_hInst, NULL);
-
-        CreateWindowA("static", "Duration:", WS_CHILD | WS_VISIBLE,
-            690, 12, 60, 20, hwnd, NULL, g_hInst, NULL);
-
-        g_hEditDuration = CreateWindowA("edit", "50",
-            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-            750, 10, 50, 22, hwnd, (HMENU)IDC_EDIT_DURATION, g_hInst, NULL);
-
-        g_hBtnStart = CreateWindowA("button", "Start",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            10, 40, 90, 28, hwnd, (HMENU)IDC_BTN_START, g_hInst, NULL);
-
-        g_hBtnStop = CreateWindowA("button", "Stop",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            110, 40, 90, 28, hwnd, (HMENU)IDC_BTN_STOP, g_hInst, NULL);
-
-        g_hBtnWeb = CreateWindowA("button", "开启Web端",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-            210, 40, 110, 28, hwnd, (HMENU)IDC_BTN_WEB, g_hInst, NULL);
-
-        g_hList = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "",
-            WS_CHILD | WS_VISIBLE | LVS_REPORT,
-            10, 80, 760, 300, hwnd, (HMENU)IDC_LIST_RESULTS, g_hInst, NULL);
-
-        g_hStatus = CreateWindowExA(0, STATUSCLASSNAMEA, NULL,
-            WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
-            0, 0, 0, 0, hwnd, (HMENU)IDC_STATUSBAR, g_hInst, NULL);
-
-        InitListView(g_hList);
-        SetStatusText("Ready");
+    case WM_CREATE:
+        CreateMainControls(hwnd);
+        LayoutControls(hwnd);
         return 0;
-    }
 
     case WM_SIZE:
-        ResizeControls(hwnd);
+        LayoutControls(hwnd);
         return 0;
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
-        case IDC_BTN_START:
-            StartWork();
-            return 0;
-        case IDC_BTN_STOP:
-            StopWork();
-            return 0;
-        case IDC_BTN_WEB:
-            MessageBoxA(hwnd, "Web端按钮已保留，但当前不自动打开。", "Info", MB_OK | MB_ICONINFORMATION);
-            return 0;
+        case 1001:
+            SetStatusText(L"测试中...");
+            StartTcping(hwnd);
+            break;
+        case 1002:
+            StopTcping();
+            SetStatusText(L"已停止");
+            break;
+        case 1003:
+            OpenWebInterface();   // 仅按钮点击时打开
+            break;
         }
-        break;
+        return 0;
 
     case WM_APP_LOG:
+    {
+        const wchar_t* line = (const wchar_t*)lParam;
+        AppendLogText(line ? line : L"");
         return 0;
+    }
 
     case WM_APP_ROW:
+    {
+        const TCPING_ROW* row = (const TCPING_ROW*)lParam;
+        UpdateListRow(row);
         return 0;
+    }
 
-    case WM_APP_STATUS: {
-        char* s = (char*)lParam;
-        if (s) {
-            SetStatusText(s);
-            free(s);
-        }
+    case WM_APP_STATUS:
+    {
+        const wchar_t* text = (const wchar_t*)lParam;
+        SetStatusText(text ? text : L"");
         return 0;
     }
 
     case WM_APP_DONE:
-        SetStatusText("Done");
+        SetStatusText(L"完成");
         return 0;
 
     case WM_DESTROY:
+        StopTcping();
         PostQuitMessage(0);
         return 0;
     }
 
-    return DefWindowProcA(hwnd, msg, wParam, lParam);
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShowCmd) {
+// ====== 程序入口 ======
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmdLine, int nShowCmd)
+{
     (void)hPrev;
     (void)lpCmdLine;
 
     g_hInst = hInst;
 
-    WNDCLASSA wc;
+    WNDCLASSW wc;
     ZeroMemory(&wc, sizeof(wc));
-    wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    wc.lpszClassName = "TCPingGUIClass";
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.lpszClassName = L"TCPingMainWindow";
 
-    if (!RegisterClassA(&wc)) {
-        MessageBoxA(NULL, "RegisterClass failed", APP_TITLE, MB_OK | MB_ICONERROR);
-        return 0;
-    }
+    RegisterClassW(&wc);
 
-    g_hWnd = CreateWindowA(
+    HWND hwnd = CreateWindowW(
         wc.lpszClassName,
-        APP_TITLE,
+        L"TCPing GUI",
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 900, 560,
+        CW_USEDEFAULT, CW_USEDEFAULT, 1100, 720,
         NULL, NULL, hInst, NULL);
 
-    if (!g_hWnd) {
-        MessageBoxA(NULL, "CreateWindow failed", APP_TITLE, MB_OK | MB_ICONERROR);
-        return 0;
-    }
+    if (!hwnd) return 0;
 
-    ShowWindow(g_hWnd, nShowCmd);
-    UpdateWindow(g_hWnd);
+    g_hwndMain = hwnd;
+    ShowWindow(hwnd, nShowCmd);
+    UpdateWindow(hwnd);
 
     MSG msg;
-    while (GetMessageA(&msg, NULL, 0, 0)) {
+    while (GetMessageW(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
-        DispatchMessageA(&msg);
+        DispatchMessageW(&msg);
     }
 
     return (int)msg.wParam;
